@@ -102,13 +102,14 @@ fn setup_world(
         ..default()
     });
 
-    // Spawn physical ground collider at Y = -0.5 so top is at Y = 0.0
+    // Spawn physical ground collider at Y = -0.5 so top surface is at Y = 0.0
     commands.spawn((
         RigidBody::Static,
         Collider::cuboid(ground_size, ground_thickness, ground_size),
+        Friction::new(0.2),
         Mesh3d(ground_mesh),
         MeshMaterial3d(ground_mat),
-        Transform::from_xyz(0.0, 0.0, 0.0),
+        Transform::from_xyz(0.0, -0.5, 0.0),
     ));
 
     // Ground boundary berms (prevent falling off world)
@@ -157,7 +158,7 @@ fn setup_world(
     ));
 
     // 3. Spawn Armored Dozer
-    let dozer_spawn_pos = Vec3::new(0.0, 0.1, 10.0);
+    let dozer_spawn_pos = Vec3::new(0.0, 1.05, 12.0);
     spawn_armored_dozer(&mut commands, &mut meshes, &mut materials, dozer_spawn_pos);
 
     // 4. Spawn Data-Driven Destructible Building from RON
@@ -186,19 +187,28 @@ fn setup_world(
     // 5. Spawn Isometric Camera with Screen Shake
     commands.spawn((
         Camera3d::default(),
-        IsometricCamera::default(),
-        Transform::from_xyz(-24.0, 22.0, 34.0).looking_at(Vec3::new(0.0, 1.0, 0.0), Vec3::Y),
+        IsometricCamera {
+            target_offset: Vec3::new(-24.0, 22.0, 24.0),
+            follow_speed: 5.0,
+            current_target: dozer_spawn_pos,
+        },
+        Transform::from_xyz(-24.0, 23.05, 36.0).looking_at(dozer_spawn_pos, Vec3::Y),
     ));
 }
 
 fn handle_reload_input(
+    keyboard: Res<ButtonInput<KeyCode>>,
     action_query: Query<&ActionState<PlayerAction>>,
     mut reload_events: EventWriter<ReloadBuildingEvent>,
 ) {
-    if let Ok(action) = action_query.get_single() {
-        if action.just_pressed(&PlayerAction::ResetBuilding) {
-            info!("ResetBuilding action triggered by player [B]");
-            reload_events.send_default();
-        }
+    let triggered = keyboard.just_pressed(KeyCode::KeyB)
+        || action_query
+            .get_single()
+            .map(|a| a.just_pressed(&PlayerAction::ResetBuilding))
+            .unwrap_or(false);
+
+    if triggered {
+        info!("ResetBuilding action triggered by player [B]");
+        reload_events.send_default();
     }
 }
