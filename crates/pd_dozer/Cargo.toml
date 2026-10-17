@@ -1,0 +1,15 @@
+[package]
+name = "pd_dozer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+avian2d.workspace = true
+leafwing-input-manager.workspace = true
+serde.workspace = true
+pd_core.workspace = true
+
+[lints]
+workspace = true

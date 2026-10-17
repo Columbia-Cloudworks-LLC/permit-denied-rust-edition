@@ -1,14 +1,64 @@
-[package]
-name = "permit_denied"
+[workspace]
+members = [
+    ".",
+    "crates/pd_core",
+    "crates/pd_dozer",
+    "crates/pd_world",
+    "crates/pd_destruction",
+    "crates/pd_ai",
+    "crates/pd_ui",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
-[dependencies]
-avian3d = "0.2"
-bevy = "0.15"
+[workspace.dependencies]
+bevy = { version = "0.15", features = ["wav"] }
+avian2d = "0.2"
+bevy_ecs_tilemap = "0.15"
 leafwing-input-manager = "0.16"
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+pd_core = { path = "crates/pd_core" }
+pd_dozer = { path = "crates/pd_dozer" }
+pd_world = { path = "crates/pd_world" }
+pd_destruction = { path = "crates/pd_destruction" }
+pd_ai = { path = "crates/pd_ai" }
+pd_ui = { path = "crates/pd_ui" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+float_cmp = "deny"
+too_many_arguments = "allow"
+type_complexity = "allow"
+
+[package]
+name = "permit_denied"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+avian2d.workspace = true
+bevy_ecs_tilemap.workspace = true
+pd_core.workspace = true
+pd_dozer.workspace = true
+pd_world.workspace = true
+pd_destruction.workspace = true
+pd_ai.workspace = true
+pd_ui.workspace = true
+
+[lints]
+workspace = true
 
 [profile.dev]
 opt-level = 1

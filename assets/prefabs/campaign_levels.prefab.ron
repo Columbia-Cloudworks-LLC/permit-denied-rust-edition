@@ -1,0 +1,54 @@
+// Declarative .ron campaign level and building prefab definitions for Permit Denied (Levels 1/7 to 7/7)
+(
+    levels: [
+        (
+            id: 1,
+            name: "1/7 County",
+            archetypes: ["Rural Farmhouse", "Timber Shed", "Hardware Shop"],
+            max_stories: 1,
+            foundation_yield_impulse: 12000.0,
+        ),
+        (
+            id: 2,
+            name: "2/7 Village",
+            archetypes: ["Corner Bakery", "Service Station", "General Store"],
+            max_stories: 2,
+            foundation_yield_impulse: 18000.0,
+        ),
+        (
+            id: 3,
+            name: "3/7 Township",
+            archetypes: ["Industrial Warehouse", "Municipal Annex", "Freight Depot"],
+            max_stories: 2,
+            foundation_yield_impulse: 24000.0,
+        ),
+        (
+            id: 4,
+            name: "4/7 Suburb",
+            archetypes: ["Two-Story Colonial", "Split-Level Garage", "Cul-de-sac Duplex"],
+            max_stories: 2,
+            foundation_yield_impulse: 28000.0,
+        ),
+        (
+            id: 5,
+            name: "5/7 City Borough",
+            archetypes: ["Mid-Rise Brick Tenement", "Corner Market", "Transit Garage"],
+            max_stories: 4,
+            foundation_yield_impulse: 38000.0,
+        ),
+        (
+            id: 6,
+            name: "6/7 City Downtown",
+            archetypes: ["Glass Curtain Skyscraper", "Commerce Tower", "Reinforced Parking Deck"],
+            max_stories: 6,
+            foundation_yield_impulse: 55000.0,
+        ),
+        (
+            id: 7,
+            name: "7/7 Governor's Mansion",
+            archetypes: ["Fortified Gatehouse", "West Wing Colonnade", "Governor's Residence"],
+            max_stories: 3,
+            foundation_yield_impulse: 68000.0,
+        ),
+    ],
+)
