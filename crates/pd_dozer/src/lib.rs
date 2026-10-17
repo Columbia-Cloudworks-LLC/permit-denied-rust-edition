@@ -9,9 +9,10 @@ use avian2d::prelude::*;
 use bevy::prelude::*;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, CashLedger, CashPopupPool, DecalKind,
-    DecalSpawnRequest, EnvironmentConfig, GameMode, ParticleBurstEvent, ParticleBurstKind,
-    PdSystemSet, PhysicsError, SessionEpoch, SiteRestartRequested, SiteScoped, sanitize_dt,
-    sanitize_f32, sanitize_vec2,
+    DecalSpawnRequest, EnvironmentConfig, GameMode, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
+    ParticleBurstEvent, ParticleBurstKind, PdSystemSet, PhysicsError, SessionEpoch,
+    SiteRestartRequested, SiteScoped, WorldPose, heading_offset, sanitize_dt, sanitize_f32,
+    sanitize_vec2, world_to_iso_screen,
 };
 use serde::{Deserialize, Serialize};
 
@@ -312,79 +313,229 @@ pub fn compute_skid_steer_kinematics(
     })
 }
 
-/// Spawns the player's armored bulldozer with a detailed multi-part 2.5D sprite hierarchy
+/// Builds the 2.5D multi-box assembly for the player's armored bulldozer, including
+/// left/right tracks, grouser pads, front/rear idlers, armored hull belly, gold engine hood,
+/// rear radiator grill, exhaust stack & cap, rear ripper assembly, armored operator cab,
+/// tinted glass visor, gold cab roof, dual roof work lights, hydraulic push arms, and
+/// 5-segment curved AR400 blade + top lip (`Issue #10`, matching `drawDozer` in `vehicles.ts`).
+#[must_use]
+pub fn build_dozer_iso_assembly(blade_state: BladeState) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let base_hull = IsoExtrudedBox::new(38.0, 26.0, 7.0, Color::srgb(0.42, 0.31, 0.07))
+        .with_offset(Vec2::ZERO, 2.0)
+        .with_shadow(true);
+
+    let mut parts = Vec::with_capacity(32);
+
+    // 1. Left & right track assemblies + grouser pads + front/rear idlers
+    for side in [-1.0_f32, 1.0_f32] {
+        let track_across = side * 14.5;
+        parts.push(
+            IsoExtrudedBox::new(40.0, 8.0, 9.5, Color::srgb(0.16, 0.16, 0.17))
+                .with_offset(Vec2::new(0.0, track_across), 0.0)
+                .with_shadow(false),
+        );
+        parts.push(
+            IsoExtrudedBox::new(30.0, 5.2, 5.0, Color::srgb(0.75, 0.56, 0.13))
+                .with_offset(Vec2::new(0.0, track_across), 2.2)
+                .with_shadow(false),
+        );
+        // Front & rear sprocket/idler hubs
+        for end in [-1.0_f32, 1.0_f32] {
+            parts.push(
+                IsoExtrudedBox::new(6.8, 6.2, 6.8, Color::srgb(0.29, 0.25, 0.19))
+                    .with_offset(Vec2::new(end * 15.0, track_across), 1.4)
+                    .with_shadow(false),
+            );
+        }
+        // Grouser bars along top of track
+        for g in -3..=3 {
+            parts.push(
+                IsoExtrudedBox::new(1.8, 7.8, 0.9, Color::srgb(0.24, 0.25, 0.27))
+                    .with_offset(Vec2::new(g as f32 * 5.2, track_across), 9.4)
+                    .with_shadow(false),
+            );
+        }
+    }
+
+    // 2. Main gold engine hood & forward nose
+    parts.push(
+        IsoExtrudedBox::new(23.0, 21.0, 12.0, Color::srgb(0.85, 0.65, 0.16))
+            .with_offset(Vec2::new(7.5, 0.0), 8.5)
+            .with_shadow(false),
+    );
+    // Side engine vents
+    parts.push(
+        IsoExtrudedBox::new(14.0, 22.0, 5.5, Color::srgb(0.23, 0.19, 0.13))
+            .with_offset(Vec2::new(9.0, 0.0), 11.5)
+            .with_shadow(false),
+    );
+    // Front radiator grille
+    parts.push(
+        IsoExtrudedBox::new(3.0, 16.0, 9.5, Color::srgb(0.16, 0.14, 0.12))
+            .with_offset(Vec2::new(18.5, 0.0), 9.5)
+            .with_shadow(false),
+    );
+
+    // 3. Exhaust stack & rain cap
+    parts.push(
+        IsoExtrudedBox::new(2.8, 2.8, 12.0, Color::srgb(0.14, 0.14, 0.16))
+            .with_offset(Vec2::new(9.0, -7.2), 20.0)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(3.8, 3.8, 1.5, Color::srgb(0.23, 0.23, 0.25))
+            .with_offset(Vec2::new(9.0, -7.2), 31.8)
+            .with_shadow(false),
+    );
+
+    // 4. Rear counterweight & 3-shank ripper
+    parts.push(
+        IsoExtrudedBox::new(10.0, 24.0, 11.0, Color::srgb(0.69, 0.51, 0.12))
+            .with_offset(Vec2::new(-14.5, 0.0), 8.5)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(5.5, 19.0, 4.2, Color::srgb(0.23, 0.21, 0.18))
+            .with_offset(Vec2::new(-21.5, 0.0), 3.0)
+            .with_shadow(false),
+    );
+    for shank in [-1.0_f32, 0.0_f32, 1.0_f32] {
+        parts.push(
+            IsoExtrudedBox::new(6.0, 2.2, 6.8, Color::srgb(0.35, 0.33, 0.29))
+                .with_offset(Vec2::new(-23.5, shank * 6.5), 0.5)
+                .with_shadow(false),
+        );
+    }
+
+    // 5. Armored ROPS Operator Cab, tinted glass, roof cap, and work lights
+    parts.push(
+        IsoExtrudedBox::new(15.0, 19.0, 4.2, Color::srgb(0.75, 0.56, 0.13))
+            .with_offset(Vec2::new(-6.0, 0.0), 17.5)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(13.0, 17.0, 9.8, Color::srgb(0.22, 0.32, 0.37))
+            .with_offset(Vec2::new(-6.0, 0.0), 21.5)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(16.0, 20.0, 2.5, Color::srgb(0.91, 0.72, 0.23))
+            .with_offset(Vec2::new(-6.0, 0.0), 31.0)
+            .with_shadow(false),
+    );
+    for side in [-1.0_f32, 1.0_f32] {
+        parts.push(
+            IsoExtrudedBox::new(2.2, 3.0, 1.8, Color::srgb(1.0, 0.96, 0.78))
+                .with_offset(Vec2::new(1.2, side * 6.5), 32.0)
+                .with_shadow(false),
+        );
+    }
+
+    // 6. Hydraulic push arms & 5-segment curved AR400 Bulldozer Blade
+    let (blade_z, blade_reach, blade_face_col, blade_lip_col) = match blade_state {
+        BladeState::BladeUp => (
+            6.5_f32,
+            24.5_f32,
+            Color::srgb(0.54, 0.56, 0.60),
+            Color::srgb(0.91, 0.72, 0.23),
+        ),
+        BladeState::BladeDown => (
+            0.5_f32,
+            27.5_f32,
+            Color::srgb(0.64, 0.66, 0.70),
+            Color::srgb(0.98, 0.78, 0.24),
+        ),
+    };
+
+    for side in [-1.0_f32, 1.0_f32] {
+        parts.push(
+            IsoExtrudedBox::new(20.0, 3.0, 3.2, Color::srgb(0.54, 0.41, 0.09))
+                .with_offset(Vec2::new(13.0, side * 12.2), blade_z + 2.5)
+                .with_shadow(false),
+        );
+    }
+
+    // 5-segment curved AR400 blade
+    let blade_width = 38.0_f32;
+    let seg_w = blade_width / 5.0 + 0.8;
+    for s in -2..=2 {
+        let frac = s as f32 / 2.0;
+        let curve_forward = (1.0 - frac * frac) * -2.8;
+        let seg_across = frac * (blade_width * 0.41);
+        parts.push(
+            IsoExtrudedBox::new(6.2, seg_w, 13.5, blade_face_col)
+                .with_offset(Vec2::new(blade_reach + curve_forward, seg_across), blade_z)
+                .with_shadow(false),
+        );
+    }
+    // Top spill guard lip
+    parts.push(
+        IsoExtrudedBox::new(4.2, blade_width + 1.0, 2.2, blade_lip_col)
+            .with_offset(Vec2::new(blade_reach - 1.5, 0.0), blade_z + 13.2)
+            .with_shadow(false),
+    );
+    // Hardened AR400 cutting edge at bottom
+    parts.push(
+        IsoExtrudedBox::new(5.5, blade_width + 1.0, 2.0, Color::srgb(0.24, 0.24, 0.26))
+            .with_offset(Vec2::new(blade_reach + 1.2, 0.0), blade_z)
+            .with_shadow(false),
+    );
+
+    (
+        base_hull,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
+}
+
+/// Spawns the player's armored bulldozer with a detailed multi-part 2.5D isometric box assembly
 /// (left/right armored tracks, industrial gold chassis, armored cab, and hydraulic AR400 blade).
 pub fn ensure_player_dozer_spawned_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
+    blade_state: Res<BladeState>,
     existing_dozer: Query<Entity, With<PlayerVehicle>>,
 ) {
     if existing_dozer.iter().next().is_some() {
         return;
     }
 
+    let spawn_world_xy = Vec2::new(0.0, -60.0);
+    let spawn_iso = world_to_iso_screen(spawn_world_xy, 0.0);
+    let (base_hull, assembly) = build_dozer_iso_assembly(*blade_state);
+
     commands
         .spawn((
             Name::new("Armored Dozer (PlayerVehicle)"),
             PlayerVehicle::default(),
             SiteScoped { epoch: *epoch },
-            Sprite {
-                color: Color::srgb(0.88, 0.66, 0.14),
-                custom_size: Some(Vec2::new(42.0, 26.0)),
-                ..Default::default()
-            },
-            Transform::from_xyz(0.0, -60.0, 25.0),
+            WorldPose::new(spawn_world_xy, 0.0, 0.0),
+            IsoLayerBias(25.0),
+            base_hull,
+            assembly,
+            Transform::from_xyz(spawn_iso.x, spawn_iso.y, 25.0),
             GlobalTransform::default(),
+            Visibility::default(),
             RigidBody::Dynamic,
             Collider::rectangle(46.0, 30.0),
             LinearVelocity::default(),
             AngularVelocity::default(),
         ))
         .with_children(|parent| {
-            // Left Armored Track
-            parent.spawn((
-                Name::new("Left Track Assembly"),
-                Sprite {
-                    color: Color::srgb(0.18, 0.19, 0.21),
-                    custom_size: Some(Vec2::new(44.0, 7.0)),
-                    ..Default::default()
-                },
-                Transform::from_xyz(0.0, 14.0, -0.5),
-                GlobalTransform::default(),
-            ));
-            // Right Armored Track
-            parent.spawn((
-                Name::new("Right Track Assembly"),
-                Sprite {
-                    color: Color::srgb(0.18, 0.19, 0.21),
-                    custom_size: Some(Vec2::new(44.0, 7.0)),
-                    ..Default::default()
-                },
-                Transform::from_xyz(0.0, -14.0, -0.5),
-                GlobalTransform::default(),
-            ));
-            // Reinforced Steel Cab Roof & Slit Visor
-            parent.spawn((
-                Name::new("Armored Operator Cab"),
-                Sprite {
-                    color: Color::srgb(0.26, 0.28, 0.30),
-                    custom_size: Some(Vec2::new(18.0, 18.0)),
-                    ..Default::default()
-                },
-                Transform::from_xyz(-6.0, 0.0, 1.0),
-                GlobalTransform::default(),
-            ));
-            // Articulating Hydraulic AR400 Edge Blade
+            // Articulating Hydraulic AR400 Edge Blade marker child for queries
             parent.spawn((
                 Name::new("AR400 Hydraulic Dozer Blade"),
                 DozerBladeVisual,
                 Sprite {
-                    color: Color::srgb(0.76, 0.78, 0.82),
+                    color: Color::NONE,
                     custom_size: Some(Vec2::new(10.0, 38.0)),
                     ..Default::default()
                 },
                 Transform::from_xyz(25.0, 0.0, 0.8),
                 GlobalTransform::default(),
+                Visibility::Hidden,
             ));
         });
 }
@@ -446,8 +597,9 @@ pub fn read_dozer_keyboard_input_system(
     track_input.right_track = right;
 }
 
-/// Executes fixed-timestep skid-steer kinematics, updates dozer velocity & HUD telemetry,
-/// animates the hydraulic blade visual, and emits persistent tread track decals + diesel smoke.
+/// Executes fixed-timestep skid-steer kinematics in Cartesian `WorldPose` coordinates,
+/// updates dozer velocity & HUD telemetry, animates the hydraulic blade visual, and emits
+/// persistent tread track decals + diesel smoke.
 pub fn fixed_dozer_kinematics_system(
     time: Res<Time>,
     env_config: Res<EnvironmentConfig>,
@@ -461,7 +613,9 @@ pub fn fixed_dozer_kinematics_system(
     mut particle_writer: EventWriter<ParticleBurstEvent>,
     mut dozer_query: Query<(
         &mut PlayerVehicle,
-        &mut Transform,
+        &mut WorldPose,
+        &mut IsoExtrudedBox,
+        &mut IsoBoxAssembly,
         &mut LinearVelocity,
         &mut AngularVelocity,
     )>,
@@ -470,7 +624,7 @@ pub fn fixed_dozer_kinematics_system(
     stress.sandbox_mode = env_config.mode == GameMode::Sandbox;
     upgrades.sync_from_cash(ledger.current_cash);
 
-    let Ok((mut vehicle, mut transform, mut lin_vel, mut ang_vel)) =
+    let Ok((mut vehicle, mut pose, mut base_box, mut assembly, mut lin_vel, mut ang_vel)) =
         dozer_query.get_single_mut()
     else {
         return;
@@ -495,7 +649,22 @@ pub fn fixed_dozer_kinematics_system(
             vehicle.heading_radians + output.angular_velocity * safe_dt,
             vehicle.heading_radians,
         );
-        transform.rotation = Quat::from_rotation_z(vehicle.heading_radians);
+        pose.heading_rad = vehicle.heading_radians;
+        pose.pos = sanitize_vec2(pose.pos + output.linear_velocity * safe_dt, pose.pos);
+
+        // Subtle chassis pitch & roll from throttle and turning
+        let forward_drive = (track_input.left_track + track_input.right_track) * 0.5;
+        let turn_drive = (track_input.right_track - track_input.left_track) * 0.5;
+        let target_pitch = (-forward_drive * 0.035).clamp(-0.08, 0.08);
+        let target_roll = (turn_drive * 0.04).clamp(-0.08, 0.08);
+        pose.pitch_rad = sanitize_f32(
+            pose.pitch_rad + (target_pitch - pose.pitch_rad) * (safe_dt * 10.0).min(1.0),
+            0.0,
+        );
+        pose.roll_rad = sanitize_f32(
+            pose.roll_rad + (target_roll - pose.roll_rad) * (safe_dt * 10.0).min(1.0),
+            0.0,
+        );
 
         // Emit mud tread tracks or ripped foundation scars when driving
         let speed = output.linear_velocity.length();
@@ -506,7 +675,7 @@ pub fn fixed_dozer_kinematics_system(
         );
         if vehicle.distance_since_last_tread_decal >= 18.0 {
             vehicle.distance_since_last_tread_decal = 0.0;
-            let pos_xy = transform.translation.truncate();
+            let pos_xy = pose.pos;
             let decal_kind = match *blade_state {
                 BladeState::BladeUp => DecalKind::MudTreadTrack,
                 BladeState::BladeDown => DecalKind::ConcreteFoundationScar,
@@ -519,50 +688,52 @@ pub fn fixed_dozer_kinematics_system(
             });
         }
 
-        // Emit diesel exhaust smoke puffs when under load or throttle
+        // Emit diesel exhaust smoke puffs from stack position when under load or throttle
         vehicle.exhaust_smoke_timer += safe_dt;
         let throttle_active =
             track_input.left_track.abs() > 0.1 || track_input.right_track.abs() > 0.1;
         if vehicle.exhaust_smoke_timer >= 0.22 && (throttle_active || stress.engine_heat_pct > 30.0)
         {
             vehicle.exhaust_smoke_timer = 0.0;
+            let stack_world = heading_offset(pose.pos, pose.heading_rad, 9.0, -7.2);
             particle_writer.send(ParticleBurstEvent {
                 kind: ParticleBurstKind::DieselExhaustSmoke,
-                world_pos: transform.translation.truncate(),
+                world_pos: stack_world,
                 count: 2,
             });
         }
     }
 
-    // Update hydraulic blade visual position & color based on BladeState
+    // Update 2.5D dozer assembly & blade visual when BladeState changes
+    if blade_state.is_changed() {
+        let (new_base, new_assembly) = build_dozer_iso_assembly(*blade_state);
+        *base_box = new_base;
+        *assembly = new_assembly;
+    }
+
     if let Ok((mut b_tf, mut b_sprite)) = blade_visual_query.get_single_mut() {
         match *blade_state {
             BladeState::BladeUp => {
                 b_tf.translation.x = 24.0;
-                b_sprite.color = Color::srgb(0.76, 0.78, 0.82);
+                b_sprite.color = Color::NONE;
             }
             BladeState::BladeDown => {
                 b_tf.translation.x = 28.5;
-                b_sprite.color = Color::srgb(0.96, 0.74, 0.22);
+                b_sprite.color = Color::NONE;
             }
         }
     }
 
     if let Some(disp) = output.depenetration_displacement {
         let safe_disp = sanitize_vec2(disp, Vec2::ZERO);
-        transform.translation.x = sanitize_f32(
-            transform.translation.x + safe_disp.x,
-            transform.translation.x,
-        );
-        transform.translation.y = sanitize_f32(
-            transform.translation.y + safe_disp.y,
-            transform.translation.y,
-        );
+        pose.pos = sanitize_vec2(pose.pos + safe_disp, pose.pos);
     }
 
-    lin_vel.0 = sanitize_vec2(output.linear_velocity, Vec2::ZERO);
-    ang_vel.0 = sanitize_f32(output.angular_velocity, 0.0);
-    popup_pool.fallback_dozer_pos = transform.translation;
+    // Zero out Avian2d automatic linear/angular velocity integration on Transform so
+    // `project_world_poses_to_isometric_transform_system` owns screen `Transform` exclusively.
+    lin_vel.0 = Vec2::ZERO;
+    ang_vel.0 = 0.0;
+    popup_pool.fallback_dozer_pos = world_to_iso_screen(pose.pos, pose.elev_z).extend(25.0);
 }
 
 /// Resets dozer gauges, upgrades, and blade state on `SiteRestartRequested`.
