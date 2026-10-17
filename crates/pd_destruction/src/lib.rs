@@ -10,8 +10,9 @@ use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use pd_core::{
     ActiveCollapseZones, AppState, AudioSfxKind, AudioTriggerEvent, CampaignLevel, CollapseZone,
-    DebugTelemetry, DemolitionCashEvent, EnvironmentConfig, IsoBoxAssembly, IsoExtrudedBox,
-    IsoLayerBias, ParticleBurstEvent, ParticleBurstKind, PdSystemSet, RoofSlopeSpec, SessionEpoch,
+    DebugTelemetry, DemolitionCashEvent, EnvironmentConfig, ISO_BIAS_BUILDING, ISO_BIAS_DEBRIS,
+    ISO_BIAS_INTERIOR_FLOOR, ISO_BIAS_PROP, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
+    ParticleBurstEvent, ParticleBurstKind, PdSystemSet, RoofSlopeSpec, SessionEpoch,
     SiteRestartRequested, SiteScoped, WorldPose, iso_depth_key, sanitize_dt, sanitize_f32,
     sanitize_vec2, world_to_iso_screen,
 };
@@ -816,7 +817,7 @@ pub fn spawn_pooled_debris_chunk(
     let safe_pos = sanitize_vec2(world_pos, Vec2::ZERO);
     let sim_z = f32::from(story_level) * 18.0 + 6.0;
     let iso_screen = world_to_iso_screen(safe_pos, sim_z);
-    let iso_z = iso_depth_key(safe_pos, sim_z, 6.0);
+    let iso_z = iso_depth_key(safe_pos, sim_z, ISO_BIAS_DEBRIS);
     let (base_box, assembly) = build_debris_iso_assembly(story_level);
 
     // Deterministic radial scatter velocity from hash of coordinates
@@ -838,15 +839,19 @@ pub fn spawn_pooled_debris_chunk(
                 spin_rate: 2.2,
             },
             WorldPose::new(safe_pos, sim_z, angle),
-            IsoLayerBias(6.0),
+            IsoLayerBias(ISO_BIAS_DEBRIS),
             base_box,
             assembly,
             Transform::from_xyz(iso_screen.x, iso_screen.y, iso_z),
             GlobalTransform::default(),
-            RigidBody::Dynamic,
-            Collider::rectangle(12.0, 8.0),
-            LinearVelocity::default(),
-            AngularVelocity::default(),
+            (
+                Position(safe_pos),
+                Rotation::radians(angle),
+                RigidBody::Dynamic,
+                Collider::rectangle(12.0, 8.0),
+                LinearVelocity::default(),
+                AngularVelocity::default(),
+            ),
         ))
         .id();
 
@@ -997,6 +1002,7 @@ pub fn poll_structural_collapse_tasks_system(
 /// Updates the 3-Tier Debris Lifecycle in Cartesian `WorldPose` space:
 /// - Tier 1 (`ActivePhysics`) -> Tier 2 (`SleepingInstanced`) once velocity settles or timer expires
 /// - Updates `DebugTelemetry` counts for the HUD Debug overlay
+#[allow(clippy::type_complexity)]
 pub fn update_debris_lifecycle_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -1008,6 +1014,8 @@ pub fn update_debris_lifecycle_system(
         Entity,
         &mut DebrisChunk,
         Option<&mut WorldPose>,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
         &mut Transform,
         Option<&LinearVelocity>,
     )>,
@@ -1019,11 +1027,18 @@ pub fn update_debris_lifecycle_system(
     let mut active_count: usize = 0;
     let mut sleeping_count: usize = 0;
 
-    for (entity, mut chunk, mut world_pose, mut transform, lin_vel) in &mut debris_query {
+    for (entity, mut chunk, mut world_pose, mut phys_pos, mut phys_rot, mut transform, lin_vel) in
+        &mut debris_query
+    {
         match chunk.tier {
             DebrisTier::ActivePhysics => {
                 active_count = active_count.saturating_add(1);
                 chunk.active_timer_secs -= dt;
+
+                if let (Some(pose), Some(pos)) = (world_pose.as_deref_mut(), phys_pos.as_deref()) {
+                    pose.pos = sanitize_vec2(pos.0, pose.pos);
+                }
+
                 if chunk.simulated_z_height > 0.0 {
                     chunk.vertical_z_velocity =
                         sanitize_f32(chunk.vertical_z_velocity - 180.0 * dt, -65.0);
@@ -1049,12 +1064,26 @@ pub fn update_debris_lifecycle_system(
                     pose.elev_z = 0.0;
                     pose.pitch_rad = 0.0;
                     chunk.horizontal_velocity *= (1.0 - dt * 6.0).clamp(0.0, 1.0);
+                    pose.pos = sanitize_vec2(
+                        pose.pos + chunk.horizontal_velocity * dt,
+                        pose.pos,
+                    );
                 }
 
-                let speed_sq = lin_vel.map_or_else(
-                    || chunk.horizontal_velocity.length_squared(),
-                    |v| sanitize_vec2(v.0, Vec2::ZERO).length_squared(),
-                );
+                if let Some(pose) = world_pose.as_deref() {
+                    if let Some(pos) = phys_pos.as_deref_mut() {
+                        pos.0 = pose.pos;
+                    }
+                    if let Some(rot) = phys_rot.as_deref_mut() {
+                        *rot = Rotation::radians(pose.heading_rad);
+                    }
+                }
+
+                let custom_speed_sq =
+                    sanitize_vec2(chunk.horizontal_velocity, Vec2::ZERO).length_squared();
+                let solver_speed_sq =
+                    lin_vel.map_or(0.0, |v| sanitize_vec2(v.0, Vec2::ZERO).length_squared());
+                let speed_sq = custom_speed_sq.max(solver_speed_sq);
                 let settled = chunk.active_timer_secs <= 0.0
                     || (chunk.simulated_z_height <= 0.01 && speed_sq < 4.0);
 
@@ -1070,6 +1099,8 @@ pub fn update_debris_lifecycle_system(
                         entity_cmds
                             .remove::<RigidBody>()
                             .remove::<Collider>()
+                            .remove::<Position>()
+                            .remove::<Rotation>()
                             .remove::<LinearVelocity>()
                             .remove::<AngularVelocity>()
                             .insert(DebrisTier::SleepingInstanced);
@@ -1155,12 +1186,12 @@ pub fn ensure_site_buildings_spawned_system(
 
         // Spawn 2.5D interior floor slab (revealed when exterior/roof cutaway fades!)
         let floor_iso = world_to_iso_screen(offset, 0.5);
-        let floor_z = iso_depth_key(offset, 0.5, 1.5);
+        let floor_z = iso_depth_key(offset, 0.5, ISO_BIAS_INTERIOR_FLOOR);
         commands.spawn((
             Name::new(format!("Building #{idx} Interior Flooring")),
             SiteScoped { epoch: *epoch },
             WorldPose::new(offset, 0.5, 0.0),
-            IsoLayerBias(1.5),
+            IsoLayerBias(ISO_BIAS_INTERIOR_FLOOR),
             IsoExtrudedBox::new(104.0, 74.0, 1.8, Color::srgb(0.82, 0.78, 0.68)).with_shadow(false),
             Transform::from_xyz(floor_iso.x, floor_iso.y, floor_z),
             GlobalTransform::default(),
@@ -1179,7 +1210,7 @@ pub fn ensure_site_buildings_spawned_system(
             );
             let prop_pos = offset + local_offset;
             let prop_iso = world_to_iso_screen(prop_pos, 2.0);
-            let prop_z = iso_depth_key(prop_pos, 2.0, 4.0);
+            let prop_z = iso_depth_key(prop_pos, 2.0, ISO_BIAS_PROP);
             let (prop_base, prop_asm) = build_prop_iso_assembly(prop_arch);
 
             commands.spawn((
@@ -1190,7 +1221,7 @@ pub fn ensure_site_buildings_spawned_system(
                     is_interior: true,
                 },
                 WorldPose::new(prop_pos, 2.0, 0.0),
-                IsoLayerBias(4.0),
+                IsoLayerBias(ISO_BIAS_PROP),
                 prop_base,
                 prop_asm,
                 Transform::from_xyz(prop_iso.x, prop_iso.y, prop_z),
@@ -1202,7 +1233,7 @@ pub fn ensure_site_buildings_spawned_system(
         let entry = BuildingGraphEntry::new(*epoch, nodes);
         let (b_base, b_asm) = build_building_iso_assembly(&entry.nodes, stories, idx);
         let b_iso = world_to_iso_screen(offset, 0.0);
-        let b_z = iso_depth_key(offset, f32::from(stories) * 16.0, 10.0);
+        let b_z = iso_depth_key(offset, f32::from(stories) * 16.0, ISO_BIAS_BUILDING);
 
         let b_entity = commands
             .spawn((
@@ -1220,14 +1251,18 @@ pub fn ensure_site_buildings_spawned_system(
                     current_roof_alpha: 1.0,
                 },
                 WorldPose::new(offset, 0.0, 0.0),
-                IsoLayerBias(10.0),
+                IsoLayerBias(ISO_BIAS_BUILDING),
                 b_base,
                 b_asm,
                 Transform::from_xyz(b_iso.x, b_iso.y, b_z),
                 GlobalTransform::default(),
                 Visibility::default(),
-                RigidBody::Static,
-                Collider::rectangle(108.0, 76.0),
+                (
+                    Position(offset),
+                    Rotation::IDENTITY,
+                    RigidBody::Static,
+                    Collider::rectangle(108.0, 76.0),
+                ),
             ))
             .id();
 
@@ -1246,7 +1281,7 @@ pub fn ensure_site_buildings_spawned_system(
 
     for (arch, pos) in exterior_specs {
         let prop_iso = world_to_iso_screen(pos, 0.0);
-        let prop_z = iso_depth_key(pos, 6.0, 6.0);
+        let prop_z = iso_depth_key(pos, 6.0, ISO_BIAS_PROP);
         let (prop_base, prop_asm) = build_prop_iso_assembly(arch);
         commands.spawn((
             Name::new(format!("Exterior Street Prop ({arch:?})")),
@@ -1256,7 +1291,7 @@ pub fn ensure_site_buildings_spawned_system(
                 is_interior: false,
             },
             WorldPose::new(pos, 0.0, 0.0),
-            IsoLayerBias(6.0),
+            IsoLayerBias(ISO_BIAS_PROP),
             prop_base,
             prop_asm,
             Transform::from_xyz(prop_iso.x, prop_iso.y, prop_z),
@@ -1397,5 +1432,64 @@ mod tests {
         );
         // All 9 upper-story nodes (3x3 at story_level == 1) must be identified as orphaned
         assert_eq!(res.orphaned_nodes.len(), 9);
+    }
+
+    #[test]
+    fn test_debris_chunk_damps_horizontal_velocity_before_settling() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<RoadSplineGraph>()
+            .init_resource::<DebrisPoolRegistry>()
+            .init_resource::<BuildingGraphRegistry>()
+            .init_resource::<DebugTelemetry>()
+            .add_systems(Update, update_debris_lifecycle_system);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                DebrisTier::ActivePhysics,
+                DebrisChunk {
+                    tier: DebrisTier::ActivePhysics,
+                    active_timer_secs: 4.0,
+                    simulated_z_height: 0.0,
+                    vertical_z_velocity: 0.0,
+                    horizontal_velocity: Vec2::new(24.0, 0.0),
+                    spin_rate: 2.2,
+                },
+                WorldPose::new(Vec2::ZERO, 0.0, 0.0),
+                Position(Vec2::ZERO),
+                Rotation::IDENTITY,
+                Transform::default(),
+                LinearVelocity::default(),
+            ))
+            .id();
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(16));
+        app.update();
+
+        // After a single ground-level tick, horizontal_velocity (24.0 -> ~21.7) is still well above
+        // the settlement threshold (speed_sq < 4.0), even though LinearVelocity is zero.
+        let chunk_after_1 = app.world().get::<DebrisChunk>(entity);
+        assert!(chunk_after_1.is_some());
+        if let Some(chunk) = chunk_after_1 {
+            assert_eq!(chunk.tier, DebrisTier::ActivePhysics);
+            assert!(chunk.horizontal_velocity.x > 18.0 && chunk.horizontal_velocity.x < 24.0);
+        }
+
+        // Advance enough ticks for ground damping to decay horizontal_velocity below 2.0 (speed_sq < 4.0)
+        for _ in 0..45 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(16));
+            app.update();
+        }
+
+        let chunk_settled = app.world().get::<DebrisChunk>(entity);
+        assert!(chunk_settled.is_some());
+        if let Some(chunk) = chunk_settled {
+            assert_eq!(chunk.tier, DebrisTier::SleepingInstanced);
+        }
     }
 }

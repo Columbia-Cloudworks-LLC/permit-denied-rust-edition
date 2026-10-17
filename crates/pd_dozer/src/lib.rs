@@ -5,14 +5,14 @@
 //!
 //! Depends only on `pd_core`.
 
-use avian2d::prelude::*;
+use avian2d::{ prelude::*, prepare::PrepareConfig, sync::SyncConfig };
 use bevy::prelude::*;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, CashLedger, CashPopupPool, DecalKind,
-    DecalSpawnRequest, EnvironmentConfig, GameMode, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
-    ParticleBurstEvent, ParticleBurstKind, PdSystemSet, PhysicsError, SessionEpoch,
-    SiteRestartRequested, SiteScoped, WorldPose, heading_offset, sanitize_dt, sanitize_f32,
-    sanitize_vec2, world_to_iso_screen,
+    DecalSpawnRequest, EnvironmentConfig, GameMode, ISO_BIAS_DOZER, IsoBoxAssembly,
+    IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind, PdSystemSet,
+    PhysicsError, SessionEpoch, SiteRestartRequested, SiteScoped, WorldPose, heading_offset,
+    iso_depth_key, sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
 };
 use serde::{Deserialize, Serialize};
 
@@ -504,6 +504,7 @@ pub fn ensure_player_dozer_spawned_system(
 
     let spawn_world_xy = Vec2::new(0.0, -60.0);
     let spawn_iso = world_to_iso_screen(spawn_world_xy, 0.0);
+    let spawn_z = iso_depth_key(spawn_world_xy, 0.0, ISO_BIAS_DOZER);
     let (base_hull, assembly) = build_dozer_iso_assembly(*blade_state);
 
     commands
@@ -512,16 +513,20 @@ pub fn ensure_player_dozer_spawned_system(
             PlayerVehicle::default(),
             SiteScoped { epoch: *epoch },
             WorldPose::new(spawn_world_xy, 0.0, 0.0),
-            IsoLayerBias(25.0),
+            IsoLayerBias(ISO_BIAS_DOZER),
             base_hull,
             assembly,
-            Transform::from_xyz(spawn_iso.x, spawn_iso.y, 25.0),
+            Transform::from_xyz(spawn_iso.x, spawn_iso.y, spawn_z),
             GlobalTransform::default(),
             Visibility::default(),
-            RigidBody::Dynamic,
-            Collider::rectangle(46.0, 30.0),
-            LinearVelocity::default(),
-            AngularVelocity::default(),
+            (
+                RigidBody::Dynamic,
+                Collider::rectangle(46.0, 30.0),
+                Position(spawn_world_xy),
+                Rotation::radians(0.0),
+                LinearVelocity::default(),
+                AngularVelocity::default(),
+            ),
         ))
         .with_children(|parent| {
             // Articulating Hydraulic AR400 Edge Blade marker child for queries
@@ -598,8 +603,9 @@ pub fn read_dozer_keyboard_input_system(
 }
 
 /// Executes fixed-timestep skid-steer kinematics in Cartesian `WorldPose` coordinates,
-/// updates dozer velocity & HUD telemetry, animates the hydraulic blade visual, and emits
-/// persistent tread track decals + diesel smoke.
+/// synchronizes solver corrections with Cartesian `Position`/`Rotation`, updates dozer velocity &
+/// HUD telemetry, animates the hydraulic blade visual, and emits persistent tread track decals +
+/// diesel smoke.
 pub fn fixed_dozer_kinematics_system(
     time: Res<Time>,
     env_config: Res<EnvironmentConfig>,
@@ -616,6 +622,8 @@ pub fn fixed_dozer_kinematics_system(
         &mut WorldPose,
         &mut IsoExtrudedBox,
         &mut IsoBoxAssembly,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
         &mut LinearVelocity,
         &mut AngularVelocity,
     )>,
@@ -624,11 +632,29 @@ pub fn fixed_dozer_kinematics_system(
     stress.sandbox_mode = env_config.mode == GameMode::Sandbox;
     upgrades.sync_from_cash(ledger.current_cash);
 
-    let Ok((mut vehicle, mut pose, mut base_box, mut assembly, mut lin_vel, mut ang_vel)) =
-        dozer_query.get_single_mut()
+    let Ok((
+        mut vehicle,
+        mut pose,
+        mut base_box,
+        mut assembly,
+        mut phys_pos,
+        mut phys_rot,
+        mut lin_vel,
+        mut ang_vel,
+    )) = dozer_query.get_single_mut()
     else {
         return;
     };
+
+    // 1. Feed any Cartesian physics solver corrections back into WorldPose before stepping
+    if let Some(pos_comp) = phys_pos.as_deref() {
+        pose.pos = sanitize_vec2(pos_comp.0, pose.pos);
+    }
+    if let Some(rot_comp) = phys_rot.as_deref() {
+        let solved_heading = sanitize_f32(rot_comp.as_radians(), vehicle.heading_radians);
+        vehicle.heading_radians = solved_heading;
+        pose.heading_rad = solved_heading;
+    }
 
     track_input.heading_radians = vehicle.heading_radians;
 
@@ -729,11 +755,18 @@ pub fn fixed_dozer_kinematics_system(
         pose.pos = sanitize_vec2(pose.pos + safe_disp, pose.pos);
     }
 
-    // Zero out Avian2d automatic linear/angular velocity integration on Transform so
-    // `project_world_poses_to_isometric_transform_system` owns screen `Transform` exclusively.
+    // 2. Write integrated Cartesian WorldPose into Avian Position/Rotation so collision solver
+    // operates purely in Cartesian world space while Transform remains projected screen space.
+    if let Some(pos_comp) = phys_pos.as_deref_mut() {
+        pos_comp.0 = pose.pos;
+    }
+    if let Some(rot_comp) = phys_rot.as_deref_mut() {
+        *rot_comp = Rotation::radians(pose.heading_rad);
+    }
     lin_vel.0 = Vec2::ZERO;
     ang_vel.0 = 0.0;
-    popup_pool.fallback_dozer_pos = world_to_iso_screen(pose.pos, pose.elev_z).extend(25.0);
+    popup_pool.fallback_dozer_pos =
+        world_to_iso_screen(pose.pos, pose.elev_z).extend(ISO_BIAS_DOZER);
 }
 
 /// Resets dozer gauges, upgrades, and blade state on `SiteRestartRequested`.
@@ -768,6 +801,15 @@ impl Plugin for PdDozerPlugin {
             .init_resource::<UpgradeMultipliers>()
             .init_resource::<MechanicalStress>()
             .init_resource::<TrackInput>()
+            .insert_resource(SyncConfig {
+                position_to_transform: false,
+                transform_to_position: false,
+                transform_to_collider_scale: false,
+            })
+            .insert_resource(PrepareConfig {
+                position_to_transform: false,
+                transform_to_position: true,
+            })
             .add_systems(
                 Update,
                 (

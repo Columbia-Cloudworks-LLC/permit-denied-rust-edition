@@ -7,12 +7,14 @@
 //! Depends only on `pd_core`.
 
 use bevy::prelude::*;
-use bevy::render::mesh::{Indices, PrimitiveTopology};
+use bevy::render::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
+use bevy::render::primitives::Aabb;
 use bevy::render::render_asset::RenderAssetUsages;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::sprite::AlphaMode2d;
 use bevy_ecs_tilemap::prelude::*;
 pub use pd_core::{
+    ISO_BIAS_GROUND_BACKDROP, ISO_BIAS_GROUND_DECALS, ISO_BIAS_GROUND_TILES, ISO_BIAS_PARTICLES,
     IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, RoofSlopeSpec, WorldPose, heading_offset,
     iso_depth_key, iso_screen_to_world, world_to_iso_screen,
 };
@@ -22,6 +24,7 @@ use pd_core::{
     WeatherSetting, sanitize_dt, sanitize_f32, sanitize_vec2, sanitize_vec3,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, VecDeque};
 
 /// Fallback tile/sprite index used whenever an out-of-bounds atlas index is requested.
@@ -347,6 +350,52 @@ pub fn push_quad_ccw(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_triangle_ccw(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    tri: [Vec2; 3],
+    z_offset: f32,
+    color: Color,
+) {
+    let [p0, p1, p2] = tri.map(|v| sanitize_vec2(v, Vec2::ZERO));
+    let safe_z = sanitize_f32(z_offset, 0.0);
+    let base_idx = positions.len() as u32;
+    let rgba = color.to_linear().to_f32_array();
+
+    positions.push([p0.x, p0.y, safe_z]);
+    positions.push([p1.x, p1.y, safe_z]);
+    positions.push([p2.x, p2.y, safe_z]);
+
+    for _ in 0..3 {
+        normals.push([0.0, 0.0, 1.0]);
+        colors.push(rgba);
+    }
+    uvs.push([0.0, 0.0]);
+    uvs.push([0.5, 1.0]);
+    uvs.push([1.0, 0.0]);
+
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+    let cross = e1.x * e2.y - e1.y * e2.x;
+    if cross >= 0.0 {
+        indices.extend_from_slice(&[
+            base_idx,
+            base_idx.saturating_add(1),
+            base_idx.saturating_add(2),
+        ]);
+    } else {
+        indices.extend_from_slice(&[
+            base_idx,
+            base_idx.saturating_add(2),
+            base_idx.saturating_add(1),
+        ]);
+    }
+}
+
 fn build_mesh_from_buffers(
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
@@ -655,21 +704,21 @@ pub fn build_site_tile_iso_mesh(
     build_mesh_from_buffers(positions, normals, uvs, colors, indices)
 }
 
-/// Appends the shadow, visible side faces, and top/sloped lid of a single `IsoExtrudedBox`
-/// (`drawOrientedIsoBox`) into the target mesh buffers in local screen coordinates around
-/// `entity_screen_origin`.
-#[allow(clippy::too_many_arguments)]
-pub fn append_extruded_box_to_buffers(
-    positions: &mut Vec<[f32; 3]>,
-    normals: &mut Vec<[f32; 3]>,
-    uvs: &mut Vec<[f32; 2]>,
-    colors: &mut Vec<[f32; 4]>,
-    indices: &mut Vec<u32>,
+fn eval_box_corners(
     entity_pose: &WorldPose,
-    entity_screen_origin: Vec2,
     spec: &IsoExtrudedBox,
-    alpha_mul: f32,
-    z_layer_offset: f32,
+) -> (
+    Vec2,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    f32,
+    [(Vec2, f32, f32); 4],
 ) {
     let box_world_center = heading_offset(
         entity_pose.pos,
@@ -687,7 +736,6 @@ pub fn append_extruded_box_to_buffers(
     let hw = sanitize_f32(spec.width, 1.0).max(0.05) * 0.5;
     let base_z0 = sanitize_f32(entity_pose.elev_z + spec.z0, 0.0).max(0.0);
     let h = sanitize_f32(spec.height, 1.0).max(0.05);
-    let alpha = (sanitize_f32(spec.alpha, 1.0) * sanitize_f32(alpha_mul, 1.0)).clamp(0.0, 1.0);
 
     let eval_corner = |along: f32, across: f32| -> (Vec2, f32, f32) {
         let w = Vec2::new(
@@ -726,31 +774,91 @@ pub fn append_extruded_box_to_buffers(
     let c1 = eval_corner(hl, hw);
     let c2 = eval_corner(-hl, hw);
     let c3 = eval_corner(-hl, -hw);
+    (
+        box_world_center,
+        fx,
+        fy,
+        rx,
+        ry,
+        hl,
+        hw,
+        base_z0,
+        h,
+        total_pitch,
+        [c0, c1, c2, c3],
+    )
+}
 
-    // 1. Footprint drop-shadow on ground plane (z = 0.0)
-    if spec.cast_shadow {
-        let shadow_quad = [
-            world_to_iso_screen(c0.0, 0.0) - entity_screen_origin,
-            world_to_iso_screen(c1.0, 0.0) - entity_screen_origin,
-            world_to_iso_screen(c2.0, 0.0) - entity_screen_origin,
-            world_to_iso_screen(c3.0, 0.0) - entity_screen_origin,
-        ];
-        let shadow_color = Color::srgba(0.10, 0.08, 0.05, (0.28 * alpha).clamp(0.0, 1.0));
-        push_quad_ccw(
-            positions,
-            normals,
-            uvs,
-            colors,
-            indices,
-            shadow_quad,
-            z_layer_offset - 0.04,
-            shadow_color,
-        );
+#[allow(clippy::too_many_arguments)]
+fn append_extruded_box_shadow_to_buffers(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    entity_pose: &WorldPose,
+    entity_screen_origin: Vec2,
+    spec: &IsoExtrudedBox,
+    alpha_mul: f32,
+    z_layer_offset: f32,
+) {
+    if !spec.cast_shadow {
+        return;
     }
+    let alpha = (sanitize_f32(spec.alpha, 1.0) * sanitize_f32(alpha_mul, 1.0)).clamp(0.0, 1.0);
+    let (_, _, _, _, _, _, _, _, _, _, [c0, c1, c2, c3]) = eval_box_corners(entity_pose, spec);
+    let shadow_quad = [
+        world_to_iso_screen(c0.0, 0.0) - entity_screen_origin,
+        world_to_iso_screen(c1.0, 0.0) - entity_screen_origin,
+        world_to_iso_screen(c2.0, 0.0) - entity_screen_origin,
+        world_to_iso_screen(c3.0, 0.0) - entity_screen_origin,
+    ];
+    let shadow_color = Color::srgba(0.10, 0.08, 0.05, (0.28 * alpha).clamp(0.0, 1.0));
+    push_quad_ccw(
+        positions,
+        normals,
+        uvs,
+        colors,
+        indices,
+        shadow_quad,
+        z_layer_offset - 0.10,
+        shadow_color,
+    );
+}
 
-    // 2. Visible camera-facing side faces sorted back-to-front by painter depth
+#[allow(clippy::too_many_arguments)]
+fn append_extruded_box_volume_to_buffers(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    entity_pose: &WorldPose,
+    entity_screen_origin: Vec2,
+    spec: &IsoExtrudedBox,
+    alpha_mul: f32,
+    z_layer_offset: f32,
+) {
+    let (
+        box_world_center,
+        fx,
+        fy,
+        rx,
+        ry,
+        hl,
+        _hw,
+        base_z0,
+        h,
+        total_pitch,
+        [c0, c1, c2, c3],
+    ) = eval_box_corners(entity_pose, spec);
+    let alpha = (sanitize_f32(spec.alpha, 1.0) * sanitize_f32(alpha_mul, 1.0)).clamp(0.0, 1.0);
+
+    // 1. Visible camera-facing side faces sorted back-to-front in a stack-backed array (zero heap allocs)
     let edges = [(c0, c1), (c1, c2), (c2, c3), (c3, c0)];
-    let mut visible_faces: Vec<(f32, [Vec2; 4], Color)> = Vec::with_capacity(4);
+    let mut visible_faces: [(f32, [Vec2; 4], Color); 4] =
+        [(0.0, [Vec2::ZERO; 4], Color::NONE); 4];
+    let mut face_count: usize = 0;
 
     for (a, b) in edges {
         let edge_vec = b.0 - a.0;
@@ -760,7 +868,7 @@ pub fn append_extruded_box_to_buffers(
         }
         let mid_w = (a.0 + b.0) * 0.5;
         let mid_z = (a.1 + a.2 + b.1 + b.2) * 0.25;
-        let depth = (mid_w.x + mid_w.y) * 1000.0 + mid_z * 2.0;
+        let depth = (mid_w.x + mid_w.y) + mid_z * 2.0;
         let normal_3d = Vec3::new(normal_2d.x, normal_2d.y, 0.0).normalize_or_zero();
         let face_color = compute_face_lighting(spec.base_color, normal_3d, alpha);
 
@@ -768,11 +876,25 @@ pub fn append_extruded_box_to_buffers(
         let top_b = world_to_iso_screen(b.0, b.2) - entity_screen_origin;
         let bot_b = world_to_iso_screen(b.0, b.1) - entity_screen_origin;
         let bot_a = world_to_iso_screen(a.0, a.1) - entity_screen_origin;
-        visible_faces.push((depth, [top_a, top_b, bot_b, bot_a], face_color));
+        if let Some(slot) = visible_faces.get_mut(face_count) {
+            *slot = (depth, [top_a, top_b, bot_b, bot_a], face_color);
+            face_count = face_count.saturating_add(1);
+        }
     }
 
-    visible_faces.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for (idx, (_, quad, face_color)) in visible_faces.into_iter().enumerate() {
+    if let Some(active_faces) = visible_faces.get_mut(..face_count) {
+        active_faces.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    for (idx, &(face_depth, quad, face_color)) in visible_faces
+        .get(..face_count)
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        let geom_z = (face_depth - (entity_pose.pos.x + entity_pose.pos.y + entity_pose.elev_z * 2.0))
+            * 0.0001
+            + z_layer_offset
+            + (idx as f32) * 0.002;
         push_quad_ccw(
             positions,
             normals,
@@ -780,12 +902,12 @@ pub fn append_extruded_box_to_buffers(
             colors,
             indices,
             quad,
-            z_layer_offset + (idx as f32) * 0.002,
+            geom_z,
             face_color,
         );
     }
 
-    // 3. Top lid (or pitched gable roof planes)
+    // 2. Top lid (or pitched gable roof planes with shaded gable end-cap triangles)
     let top_z_offset = z_layer_offset + 0.01;
     if let Some(RoofSlopeSpec::Gable { ridge_scale, .. }) = spec.roof_slope {
         let r_scale = sanitize_f32(ridge_scale, 1.15).max(0.1);
@@ -800,6 +922,57 @@ pub fn append_extruded_box_to_buffers(
         let t3 = world_to_iso_screen(c3.0, c3.2) - entity_screen_origin;
         let trf = world_to_iso_screen(rf_world, rf_z) - entity_screen_origin;
         let trb = world_to_iso_screen(rb_world, rb_z) - entity_screen_origin;
+
+        // Shaded triangular gable end-caps connecting the eaves to the ridge
+        let n_front = Vec3::new(fx, fy, 0.0).normalize_or_zero();
+        let n_back = Vec3::new(-fx, -fy, 0.0).normalize_or_zero();
+        let front_cap_color = compute_face_lighting(spec.base_color, n_front, alpha);
+        let back_cap_color = compute_face_lighting(spec.base_color, n_back, alpha);
+        let depth_front = rf_world.x + rf_world.y + rf_z * 2.0;
+        let depth_back = rb_world.x + rb_world.y + rb_z * 2.0;
+        if depth_back <= depth_front {
+            push_triangle_ccw(
+                positions,
+                normals,
+                uvs,
+                colors,
+                indices,
+                [t2, trb, t3],
+                top_z_offset - 0.002,
+                back_cap_color,
+            );
+            push_triangle_ccw(
+                positions,
+                normals,
+                uvs,
+                colors,
+                indices,
+                [t0, trf, t1],
+                top_z_offset - 0.001,
+                front_cap_color,
+            );
+        } else {
+            push_triangle_ccw(
+                positions,
+                normals,
+                uvs,
+                colors,
+                indices,
+                [t0, trf, t1],
+                top_z_offset - 0.002,
+                front_cap_color,
+            );
+            push_triangle_ccw(
+                positions,
+                normals,
+                uvs,
+                colors,
+                indices,
+                [t2, trb, t3],
+                top_z_offset - 0.001,
+                back_cap_color,
+            );
+        }
 
         let n_left = Vec3::new(-rx * 0.35, -ry * 0.35, 0.92).normalize_or_zero();
         let n_right = Vec3::new(rx * 0.35, ry * 0.35, 0.92).normalize_or_zero();
@@ -882,6 +1055,412 @@ pub fn append_extruded_box_to_buffers(
     }
 }
 
+/// Appends the shadow, visible side faces, and top/sloped lid of a single `IsoExtrudedBox`
+/// (`drawOrientedIsoBox`) into the target mesh buffers in local screen coordinates around
+/// `entity_screen_origin`.
+#[allow(clippy::too_many_arguments)]
+pub fn append_extruded_box_to_buffers(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    entity_pose: &WorldPose,
+    entity_screen_origin: Vec2,
+    spec: &IsoExtrudedBox,
+    alpha_mul: f32,
+    z_layer_offset: f32,
+) {
+    append_extruded_box_shadow_to_buffers(
+        positions,
+        normals,
+        uvs,
+        colors,
+        indices,
+        entity_pose,
+        entity_screen_origin,
+        spec,
+        alpha_mul,
+        z_layer_offset,
+    );
+    append_extruded_box_volume_to_buffers(
+        positions,
+        normals,
+        uvs,
+        colors,
+        indices,
+        entity_pose,
+        entity_screen_origin,
+        spec,
+        alpha_mul,
+        z_layer_offset,
+    );
+}
+
+/// Precomputed 3D world bounds and 2D screen bounds for a single `IsoExtrudedBox` inside an
+/// assembly, enabling overlap-aware 3D ray-depth ordering.
+#[derive(Debug, Clone, Copy)]
+pub struct OrderedBoxEntry {
+    pub spec: IsoExtrudedBox,
+    pub world_center: Vec2,
+    pub fx: f32,
+    pub fy: f32,
+    pub rx: f32,
+    pub ry: f32,
+    pub hl: f32,
+    pub hw: f32,
+    pub z_min: f32,
+    pub z_max: f32,
+    pub s_min: f32,
+    pub s_max: f32,
+    pub screen_min: Vec2,
+    pub screen_max: Vec2,
+    pub ray_depth: f32,
+}
+
+impl OrderedBoxEntry {
+    #[must_use]
+    pub fn from_box(entity_pose: &WorldPose, spec: IsoExtrudedBox) -> Self {
+        let (world_center, fx, fy, rx, ry, hl, hw, base_z0, h, _, corners) =
+            eval_box_corners(entity_pose, &spec);
+
+        let mut z_min = f32::MAX;
+        let mut z_max = f32::MIN;
+        let mut s_min = f32::MAX;
+        let mut s_max = f32::MIN;
+        let mut screen_min = Vec2::splat(f32::MAX);
+        let mut screen_max = Vec2::splat(f32::MIN);
+
+        for (w, zb, zt) in corners {
+            let s = w.x + w.y;
+            s_min = s_min.min(s);
+            s_max = s_max.max(s);
+            z_min = z_min.min(zb);
+            z_max = z_max.max(zt);
+
+            let sb = world_to_iso_screen(w, zb);
+            let st = world_to_iso_screen(w, zt);
+            screen_min = screen_min.min(sb).min(st);
+            screen_max = screen_max.max(sb).max(st);
+        }
+
+        if let Some(RoofSlopeSpec::Gable { ridge_scale, .. }) = spec.roof_slope {
+            let r_scale = sanitize_f32(ridge_scale, 1.15).max(0.1);
+            let ridge_top = (base_z0 + h * r_scale).max(z_max);
+            z_max = z_max.max(ridge_top);
+            let rf_s = world_to_iso_screen(
+                Vec2::new(world_center.x + fx * hl, world_center.y + fy * hl),
+                ridge_top,
+            );
+            let rb_s = world_to_iso_screen(
+                Vec2::new(world_center.x - fx * hl, world_center.y - fy * hl),
+                ridge_top,
+            );
+            screen_min = screen_min.min(rf_s).min(rb_s);
+            screen_max = screen_max.max(rf_s).max(rb_s);
+        }
+
+        let z_mid = (z_min + z_max) * 0.5;
+        let ray_depth = (world_center.x + world_center.y) + 2.0 * z_mid;
+
+        Self {
+            spec,
+            world_center,
+            fx,
+            fy,
+            rx,
+            ry,
+            hl,
+            hw,
+            z_min,
+            z_max,
+            s_min,
+            s_max,
+            screen_min,
+            screen_max,
+            ray_depth,
+        }
+    }
+
+    /// Computes the `[z_enter, z_exit]` interval along the isometric viewing ray passing through
+    /// `screen_pt` (`world_to_iso_screen` coordinates). Larger `z` along a shared screen ray is
+    /// strictly closer to the camera.
+    #[must_use]
+    pub fn ray_interval_at_screen_point(&self, screen_pt: Vec2) -> Option<(f32, f32)> {
+        let mut t0 = self.z_min;
+        let mut t1 = self.z_max;
+
+        let p0 = Vec2::new(
+            0.5 * screen_pt.x - screen_pt.y,
+            -0.5 * screen_pt.x - screen_pt.y,
+        );
+        let d0 = p0 - self.world_center;
+
+        let clip_slab = |a0: f32, ad: f32, half_ext: f32, t_min: &mut f32, t_max: &mut f32| -> bool {
+            if ad.abs() < 1e-5 {
+                a0.abs() <= half_ext + 1e-3
+            } else {
+                let inv = 1.0 / ad;
+                let u0 = (-half_ext - a0) * inv;
+                let u1 = (half_ext - a0) * inv;
+                let (lo, hi) = if u0 <= u1 { (u0, u1) } else { (u1, u0) };
+                *t_min = t_min.max(lo);
+                *t_max = t_max.min(hi);
+                *t_min <= *t_max + 0.05
+            }
+        };
+
+        let a0 = d0.x * self.fx + d0.y * self.fy;
+        let ad = self.fx + self.fy;
+        if !clip_slab(a0, ad, self.hl, &mut t0, &mut t1) {
+            return None;
+        }
+
+        let b0 = d0.x * self.rx + d0.y * self.ry;
+        let bd = self.rx + self.ry;
+        if !clip_slab(b0, bd, self.hw, &mut t0, &mut t1) {
+            return None;
+        }
+
+        Some((t0, t1.max(t0)))
+    }
+}
+
+fn compare_overlapping_boxes(a: &OrderedBoxEntry, b: &OrderedBoxEntry) -> Option<Ordering> {
+    let ov_min = a.screen_min.max(b.screen_min);
+    let ov_max = a.screen_max.min(b.screen_max);
+    if ov_min.x >= ov_max.x - 0.05 || ov_min.y >= ov_max.y - 0.05 {
+        return None;
+    }
+
+    // 1. Non-overlapping vertical (Z) separation
+    if b.z_min >= a.z_max - 0.15 && b.z_max > a.z_max {
+        return Some(Ordering::Less);
+    }
+    if a.z_min >= b.z_max - 0.15 && a.z_max > b.z_max {
+        return Some(Ordering::Greater);
+    }
+
+    // 2. Non-overlapping horizontal diagonal (s = x + y) separation
+    if b.s_min >= a.s_max - 0.15 && b.s_max > a.s_max {
+        return Some(Ordering::Less);
+    }
+    if a.s_min >= b.s_max - 0.15 && a.s_max > b.s_max {
+        return Some(Ordering::Greater);
+    }
+
+    // 3. Exact ray-slab depth comparison at sample points inside the 2D screen overlap region
+    let mid = (ov_min + ov_max) * 0.5;
+    let q1 = ov_min * 0.65 + ov_max * 0.35;
+    let q2 = ov_min * 0.35 + ov_max * 0.65;
+    let q3 = Vec2::new(q1.x, q2.y);
+    let q4 = Vec2::new(q2.x, q1.y);
+    for pt in [mid, q1, q2, q3, q4] {
+        if let (Some((a_t0, a_t1)), Some((b_t0, b_t1))) = (
+            a.ray_interval_at_screen_point(pt),
+            b.ray_interval_at_screen_point(pt),
+        ) {
+            let a_key = a_t1 + a_t0 * 0.25;
+            let b_key = b_t1 + b_t0 * 0.25;
+            if (a_key - b_key).abs() > 0.05 {
+                return Some(a_key.total_cmp(&b_key));
+            }
+        }
+    }
+
+    Some(a.ray_depth.total_cmp(&b.ray_depth))
+}
+
+/// Reusable scratch buffer for sorting multi-box assemblies without per-frame heap allocations.
+#[derive(Debug, Default, Clone)]
+pub struct IsoMeshBuildScratch {
+    pub ordered_boxes: Vec<OrderedBoxEntry>,
+}
+
+/// Populates and sorts `out` in back-to-front painter's order for `pose`, `root_box`, and `assembly`.
+pub fn order_assembly_boxes_for_pose(
+    pose: &WorldPose,
+    root_box: &IsoExtrudedBox,
+    assembly: Option<&IsoBoxAssembly>,
+    out: &mut Vec<OrderedBoxEntry>,
+) {
+    let safe_pose = pose.sanitized();
+    out.clear();
+    let extra_count = assembly.map_or(0, |a| a.parts.len());
+    let total_boxes = 1_usize.saturating_add(extra_count);
+    if out.capacity() < total_boxes {
+        out.reserve(total_boxes.saturating_sub(out.capacity()));
+    }
+
+    out.push(OrderedBoxEntry::from_box(&safe_pose, *root_box));
+    if let Some(asm) = assembly {
+        for part in &asm.parts {
+            out.push(OrderedBoxEntry::from_box(&safe_pose, *part));
+        }
+    }
+
+    out.sort_by(|a, b| a.ray_depth.total_cmp(&b.ray_depth));
+
+    let len = out.len();
+    for _ in 0..len {
+        let mut swapped = false;
+        for i in 0..len {
+            for j in (i + 1)..len {
+                let should_swap = if let (Some(bi), Some(bj)) = (out.get(i), out.get(j)) {
+                    compare_overlapping_boxes(bi, bj) == Some(Ordering::Greater)
+                } else {
+                    false
+                };
+                if should_swap {
+                    out.swap(i, j);
+                    swapped = true;
+                }
+            }
+        }
+        if !swapped {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn populate_extruded_box_buffers_with_scratch(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    uvs: &mut Vec<[f32; 2]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+    scratch: &mut IsoMeshBuildScratch,
+    pose: &WorldPose,
+    root_box: &IsoExtrudedBox,
+    assembly: Option<&IsoBoxAssembly>,
+) {
+    let safe_pose = pose.sanitized();
+    let entity_screen_origin = world_to_iso_screen(safe_pose.pos, safe_pose.elev_z);
+    let alpha_mul = assembly.map_or(1.0, |a| sanitize_f32(a.alpha_multiplier, 1.0));
+
+    order_assembly_boxes_for_pose(&safe_pose, root_box, assembly, &mut scratch.ordered_boxes);
+
+    positions.clear();
+    normals.clear();
+    uvs.clear();
+    colors.clear();
+    indices.clear();
+
+    // Pass 1: Emit all ground drop-shadows first so shadows never draw over 3D walls/roofs
+    for (idx, entry) in scratch.ordered_boxes.iter().enumerate() {
+        append_extruded_box_shadow_to_buffers(
+            positions,
+            normals,
+            uvs,
+            colors,
+            indices,
+            &safe_pose,
+            entity_screen_origin,
+            &entry.spec,
+            alpha_mul,
+            (idx as f32) * 0.001,
+        );
+    }
+
+    // Pass 2: Emit 3D box volumes in overlap-aware back-to-front painter's order
+    for (idx, entry) in scratch.ordered_boxes.iter().enumerate() {
+        append_extruded_box_volume_to_buffers(
+            positions,
+            normals,
+            uvs,
+            colors,
+            indices,
+            &safe_pose,
+            entity_screen_origin,
+            &entry.spec,
+            alpha_mul,
+            (idx as f32) * 0.02,
+        );
+    }
+}
+
+/// Updates an existing `Mesh` asset in place by extracting and reusing its attribute/index `Vec`
+/// allocations alongside `scratch`, avoiding per-frame heap churn in hot loops.
+pub fn update_iso_extruded_box_mesh_in_place(
+    mesh: &mut Mesh,
+    scratch: &mut IsoMeshBuildScratch,
+    pose: &WorldPose,
+    root_box: &IsoExtrudedBox,
+    assembly: Option<&IsoBoxAssembly>,
+) {
+    let total_boxes = 1_usize.saturating_add(assembly.map_or(0, |a| a.parts.len()));
+    let mut positions = match mesh.remove_attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(VertexAttributeValues::Float32x3(v)) => v,
+        _ => Vec::with_capacity(total_boxes * 16),
+    };
+    let mut normals = match mesh.remove_attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(v)) => v,
+        _ => Vec::with_capacity(total_boxes * 16),
+    };
+    let mut uvs = match mesh.remove_attribute(Mesh::ATTRIBUTE_UV_0) {
+        Some(VertexAttributeValues::Float32x2(v)) => v,
+        _ => Vec::with_capacity(total_boxes * 16),
+    };
+    let mut colors = match mesh.remove_attribute(Mesh::ATTRIBUTE_COLOR) {
+        Some(VertexAttributeValues::Float32x4(v)) => v,
+        _ => Vec::with_capacity(total_boxes * 16),
+    };
+    let mut indices = match mesh.remove_indices() {
+        Some(Indices::U32(v)) => v,
+        _ => Vec::with_capacity(total_boxes * 24),
+    };
+
+    populate_extruded_box_buffers_with_scratch(
+        &mut positions,
+        &mut normals,
+        &mut uvs,
+        &mut colors,
+        &mut indices,
+        scratch,
+        pose,
+        root_box,
+        assembly,
+    );
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+}
+
+/// Builds a complete 2.5D extruded isometric `Mesh` (`drawOrientedIsoBox`) for an entity's
+/// primary `IsoExtrudedBox` and optional multi-part `IsoBoxAssembly` using reusable `scratch`.
+#[must_use]
+pub fn build_iso_extruded_box_mesh_with_scratch(
+    scratch: &mut IsoMeshBuildScratch,
+    pose: &WorldPose,
+    root_box: &IsoExtrudedBox,
+    assembly: Option<&IsoBoxAssembly>,
+) -> Mesh {
+    let total_boxes = 1_usize.saturating_add(assembly.map_or(0, |a| a.parts.len()));
+    let mut positions = Vec::with_capacity(total_boxes * 16);
+    let mut normals = Vec::with_capacity(total_boxes * 16);
+    let mut uvs = Vec::with_capacity(total_boxes * 16);
+    let mut colors = Vec::with_capacity(total_boxes * 16);
+    let mut indices = Vec::with_capacity(total_boxes * 24);
+
+    populate_extruded_box_buffers_with_scratch(
+        &mut positions,
+        &mut normals,
+        &mut uvs,
+        &mut colors,
+        &mut indices,
+        scratch,
+        pose,
+        root_box,
+        assembly,
+    );
+
+    build_mesh_from_buffers(positions, normals, uvs, colors, indices)
+}
+
 /// Builds a complete 2.5D extruded isometric `Mesh` (`drawOrientedIsoBox`) for an entity's
 /// primary `IsoExtrudedBox` and optional multi-part `IsoBoxAssembly`, sorted in painter's order.
 #[must_use]
@@ -890,60 +1469,8 @@ pub fn build_iso_extruded_box_mesh(
     root_box: &IsoExtrudedBox,
     assembly: Option<&IsoBoxAssembly>,
 ) -> Mesh {
-    let safe_pose = pose.sanitized();
-    let entity_screen_origin = world_to_iso_screen(safe_pose.pos, safe_pose.elev_z);
-    let alpha_mul = assembly.map_or(1.0, |a| sanitize_f32(a.alpha_multiplier, 1.0));
-
-    let extra_count = assembly.map_or(0, |a| a.parts.len());
-    let total_boxes = 1_usize.saturating_add(extra_count);
-    let mut positions = Vec::with_capacity(total_boxes * 16);
-    let mut normals = Vec::with_capacity(total_boxes * 16);
-    let mut uvs = Vec::with_capacity(total_boxes * 16);
-    let mut colors = Vec::with_capacity(total_boxes * 16);
-    let mut indices = Vec::with_capacity(total_boxes * 24);
-
-    let mut ordered_boxes: Vec<(f32, IsoExtrudedBox)> = Vec::with_capacity(total_boxes);
-    let root_world = heading_offset(
-        safe_pose.pos,
-        safe_pose.heading_rad,
-        root_box.center.x,
-        root_box.center.y,
-    );
-    let root_depth =
-        (root_world.x + root_world.y) * 1000.0 + (root_box.z0 + root_box.height * 0.5) * 2.0;
-    ordered_boxes.push((root_depth, *root_box));
-
-    if let Some(asm) = assembly {
-        for part in &asm.parts {
-            let pw = heading_offset(
-                safe_pose.pos,
-                safe_pose.heading_rad,
-                part.center.x,
-                part.center.y,
-            );
-            let p_depth = (pw.x + pw.y) * 1000.0 + (part.z0 + part.height * 0.5) * 2.0;
-            ordered_boxes.push((p_depth, *part));
-        }
-    }
-
-    ordered_boxes.sort_by(|a, b| a.0.total_cmp(&b.0));
-
-    for (idx, (_, b_spec)) in ordered_boxes.into_iter().enumerate() {
-        append_extruded_box_to_buffers(
-            &mut positions,
-            &mut normals,
-            &mut uvs,
-            &mut colors,
-            &mut indices,
-            &safe_pose,
-            entity_screen_origin,
-            &b_spec,
-            alpha_mul,
-            (idx as f32) * 0.02,
-        );
-    }
-
-    build_mesh_from_buffers(positions, normals, uvs, colors, indices)
+    let mut scratch = IsoMeshBuildScratch::default();
+    build_iso_extruded_box_mesh_with_scratch(&mut scratch, pose, root_box, assembly)
 }
 
 /// Shared vertex-color `ColorMaterial` handle used by all 2.5D isometric meshes.
@@ -974,28 +1501,72 @@ impl IsoMeshCacheKey {
         root_box: &IsoExtrudedBox,
         assembly: Option<&IsoBoxAssembly>,
     ) -> Self {
+        let mix = |acc: u64, val: u64| -> u64 {
+            let mut z = acc.wrapping_add(val).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let quant = |v: f32, scale: f32| -> u64 {
+            (sanitize_f32(v, 0.0) * scale).round() as i64 as u64
+        };
         let hash_box = |acc: u64, b: &IsoExtrudedBox| -> u64 {
             let c = b.base_color.to_srgba();
-            let cr = (c.red.clamp(0.0, 1.0) * 255.0) as u64;
-            let cg = (c.green.clamp(0.0, 1.0) * 255.0) as u64;
-            let cb = (c.blue.clamp(0.0, 1.0) * 255.0) as u64;
-            let cx = (sanitize_f32(b.center.x, 0.0) * 10.0).round() as i64 as u64;
-            let cy = (sanitize_f32(b.center.y, 0.0) * 10.0).round() as i64 as u64;
-            let z0 = (sanitize_f32(b.z0, 0.0) * 10.0).round() as i64 as u64;
-            let h = (sanitize_f32(b.height, 0.0) * 10.0).round() as i64 as u64;
-            let mut v = acc.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(cx);
-            v = v.wrapping_mul(0xBF58_476D_1CE4_E5B9).wrapping_add(cy);
-            v = v.wrapping_mul(0x94D0_49BB_1331_11EB).wrapping_add(z0 ^ (h << 16));
-            v ^ ((cr << 16) | (cg << 8) | cb)
+            let cr = (c.red.clamp(0.0, 1.0) * 255.0).round() as u64;
+            let cg = (c.green.clamp(0.0, 1.0) * 255.0).round() as u64;
+            let cb = (c.blue.clamp(0.0, 1.0) * 255.0).round() as u64;
+            let ca = (c.alpha.clamp(0.0, 1.0) * 255.0).round() as u64;
+            let color_u64 = (cr << 24) | (cg << 16) | (cb << 8) | ca;
+
+            let mut v = mix(acc, quant(b.center.x, 100.0));
+            v = mix(v, quant(b.center.y, 100.0));
+            v = mix(v, quant(b.heading, 1000.0));
+            v = mix(v, quant(b.pitch, 1000.0));
+            v = mix(v, quant(b.roll, 1000.0));
+            v = mix(v, quant(b.length, 100.0));
+            v = mix(v, quant(b.width, 100.0));
+            v = mix(v, quant(b.z0, 100.0));
+            v = mix(v, quant(b.height, 100.0));
+            v = mix(v, quant(b.alpha, 1000.0));
+            v = mix(v, u64::from(b.cast_shadow));
+            v = mix(v, color_u64);
+            match b.roof_slope {
+                None => mix(v, 0),
+                Some(RoofSlopeSpec::AcrossWidth {
+                    low_scale,
+                    high_scale,
+                }) => {
+                    let s1 = mix(v, 1);
+                    let s2 = mix(s1, quant(low_scale, 1000.0));
+                    mix(s2, quant(high_scale, 1000.0))
+                }
+                Some(RoofSlopeSpec::AlongLength {
+                    back_scale,
+                    front_scale,
+                }) => {
+                    let s1 = mix(v, 2);
+                    let s2 = mix(s1, quant(back_scale, 1000.0));
+                    mix(s2, quant(front_scale, 1000.0))
+                }
+                Some(RoofSlopeSpec::Gable {
+                    eave_scale,
+                    ridge_scale,
+                }) => {
+                    let s1 = mix(v, 3);
+                    let s2 = mix(s1, quant(eave_scale, 1000.0));
+                    mix(s2, quant(ridge_scale, 1000.0))
+                }
+            }
         };
 
         let srgba = root_box.base_color.to_srgba();
-        let r = (srgba.red.clamp(0.0, 1.0) * 255.0) as u32;
-        let g = (srgba.green.clamp(0.0, 1.0) * 255.0) as u32;
-        let b = (srgba.blue.clamp(0.0, 1.0) * 255.0) as u32;
+        let r = (srgba.red.clamp(0.0, 1.0) * 255.0).round() as u32;
+        let g = (srgba.green.clamp(0.0, 1.0) * 255.0).round() as u32;
+        let b = (srgba.blue.clamp(0.0, 1.0) * 255.0).round() as u32;
         let color_bits = (r << 16) | (g << 8) | b;
-        let asm_alpha = assembly.map_or(1.0, |a| a.alpha_multiplier);
-        let mut assembly_hash = hash_box(0x517C_C1B7_2722_0A95, root_box);
+        let asm_alpha = assembly.map_or(1.0, |a| sanitize_f32(a.alpha_multiplier, 1.0));
+        let mut assembly_hash = mix(0x517C_C1B7_2722_0A95, quant(asm_alpha, 1000.0));
+        assembly_hash = hash_box(assembly_hash, root_box);
         if let Some(asm) = assembly {
             for part in &asm.parts {
                 assembly_hash = hash_box(assembly_hash, part);
@@ -1444,7 +2015,7 @@ pub fn spawn_pooled_world_particle(
     let safe_pos = sanitize_vec2(pos, Vec2::ZERO);
     let safe_size = sanitize_vec2(size, Vec2::splat(4.0)).clamp(Vec2::splat(1.5), Vec2::splat(24.0));
     let screen = world_to_iso_screen(safe_pos, 14.0);
-    let z = iso_depth_key(safe_pos, 14.0, 120.0);
+    let z = iso_depth_key(safe_pos, 14.0, ISO_BIAS_PARTICLES);
 
     let p_ent = commands
         .spawn((
@@ -1455,7 +2026,7 @@ pub fn spawn_pooled_world_particle(
                 remaining_secs: lifetime.clamp(0.1, 4.0),
             },
             WorldPose::new(safe_pos, 14.0, 0.35),
-            IsoLayerBias(120.0),
+            IsoLayerBias(ISO_BIAS_PARTICLES),
             IsoExtrudedBox::new(
                 safe_size.x,
                 safe_size.y,
@@ -1524,8 +2095,8 @@ pub fn ensure_site_ground_spawned_system(
         },
         SiteScoped { epoch: *epoch },
         WorldPose::from_xy(0.0, 0.0),
-        IsoLayerBias(-550.0),
-        Transform::from_xyz(0.0, 0.0, -550.0),
+        IsoLayerBias(ISO_BIAS_GROUND_BACKDROP),
+        Transform::from_xyz(0.0, 0.0, ISO_BIAS_GROUND_BACKDROP),
         GlobalTransform::default(),
     ));
     if let Some(meshes_mut) = meshes.as_deref_mut() {
@@ -1609,7 +2180,7 @@ pub fn ensure_site_ground_spawned_system(
                 (gy as f32 + 0.5) * WORLD_TILE_SIZE,
             );
             let screen = world_to_iso_screen(tile_center_world, 0.0);
-            let z = iso_depth_key(tile_center_world, 0.0, -480.0);
+            let z = iso_depth_key(tile_center_world, 0.0, ISO_BIAS_GROUND_TILES);
 
             let tile_pos = TilePos {
                 x: (gx + half_grid) as u32,
@@ -1623,7 +2194,7 @@ pub fn ensure_site_ground_spawned_system(
                 TilemapId(tilemap_entity),
                 TileTextureIndex(valid_idx),
                 WorldPose::from_xy(tile_center_world.x, tile_center_world.y),
-                IsoLayerBias(-480.0),
+                IsoLayerBias(ISO_BIAS_GROUND_TILES),
                 Transform::from_xyz(screen.x, screen.y, z),
                 GlobalTransform::default(),
             ));
@@ -1688,7 +2259,7 @@ pub fn process_ground_decal_requests_system(
         };
 
         let screen = world_to_iso_screen(safe_pos, 0.0);
-        let z = iso_depth_key(safe_pos, 0.0, -420.0);
+        let z = iso_depth_key(safe_pos, 0.0, ISO_BIAS_GROUND_DECALS);
         let mut decal_cmds = commands.spawn((
             Name::new("Dynamic Ground Decal"),
             SiteScoped { epoch: *epoch },
@@ -1696,7 +2267,7 @@ pub fn process_ground_decal_requests_system(
                 kind: TerrainTileKind::RubbleScar,
             },
             WorldPose::new(safe_pos, 0.0, safe_rot),
-            IsoLayerBias(-420.0),
+            IsoLayerBias(ISO_BIAS_GROUND_DECALS),
             Transform::from_xyz(screen.x, screen.y, z),
             GlobalTransform::default(),
         ));
@@ -1887,11 +2458,14 @@ pub fn project_world_poses_to_isometric_transform_system(
 }
 
 /// Generates or updates 2.5D extruded isometric `Mesh2d` assets for all entities carrying
-/// `IsoExtrudedBox` (and optional `IsoBoxAssembly` / `WorldPose`). Safely no-ops in headless
-/// `MinimalPlugins` tests where `Assets<Mesh>` is absent.
+/// `IsoExtrudedBox` (and optional `IsoBoxAssembly` / `WorldPose`). Reuses mesh attribute/index
+/// buffers and `Local<IsoMeshBuildScratch>` across rebuilds, removes stale `Aabb` bounds so Bevy
+/// recomputes accurate culling bounds, and safely no-ops in headless `MinimalPlugins` tests where
+/// `Assets<Mesh>` is absent.
 pub fn sync_iso_extruded_box_meshes_system(
     mut commands: Commands,
     mut shared_mat: ResMut<SharedIsoColorMaterial>,
+    mut scratch: Local<IsoMeshBuildScratch>,
     meshes: Option<ResMut<Assets<Mesh>>>,
     mut materials: Option<ResMut<Assets<ColorMaterial>>>,
     query: Query<(
@@ -1920,17 +2494,28 @@ pub fn sync_iso_extruded_box_meshes_system(
             continue;
         }
 
-        let built_mesh = build_iso_extruded_box_mesh(&pose, root_box, maybe_assembly);
         if let Some(existing_mesh2d) = maybe_mesh2d
             && let Some(mesh_asset) = meshes.get_mut(&existing_mesh2d.0)
         {
-            *mesh_asset = built_mesh;
+            update_iso_extruded_box_mesh_in_place(
+                mesh_asset,
+                &mut scratch,
+                &pose,
+                root_box,
+                maybe_assembly,
+            );
             if let Some(mut e_cmds) = commands.get_entity(entity) {
-                e_cmds.insert(new_key);
+                e_cmds.remove::<Aabb>().insert(new_key);
             }
         } else if let Some(mut e_cmds) = commands.get_entity(entity) {
+            let built_mesh = build_iso_extruded_box_mesh_with_scratch(
+                &mut scratch,
+                &pose,
+                root_box,
+                maybe_assembly,
+            );
             let handle = meshes.add(built_mesh);
-            e_cmds.insert((Mesh2d(handle), new_key));
+            e_cmds.remove::<Aabb>().insert((Mesh2d(handle), new_key));
             if let Some(mat) = &mat_handle {
                 e_cmds.insert(MeshMaterial2d(mat.clone()));
             }
@@ -2022,9 +2607,141 @@ mod tests {
                 eave_scale: 0.5,
                 ridge_scale: 1.2,
             });
-        let mesh = build_iso_extruded_box_mesh(&pose, &iso_box, None);
-        assert!(mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
-        assert!(mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
-        assert!(mesh.indices().is_some());
+        let flat_box = IsoExtrudedBox::new(30.0, 20.0, 18.0, base).with_shadow(true);
+        let gable_mesh = build_iso_extruded_box_mesh(&pose, &iso_box, None);
+        let flat_mesh = build_iso_extruded_box_mesh(&pose, &flat_box, None);
+        assert!(gable_mesh.attribute(Mesh::ATTRIBUTE_POSITION).is_some());
+        assert!(gable_mesh.attribute(Mesh::ATTRIBUTE_COLOR).is_some());
+        assert!(gable_mesh.indices().is_some());
+
+        // Gable roof adds two roof slope quads + two triangular end-caps (6 extra vertices over flat lid)
+        let gable_verts = gable_mesh.count_vertices();
+        let flat_verts = flat_mesh.count_vertices();
+        assert_eq!(gable_verts, flat_verts + 10);
+    }
+
+    #[test]
+    fn test_overlapping_assembly_box_depth_ordering_hull_vs_cab() {
+        let pose = WorldPose::new(Vec2::ZERO, 0.0, 0.0);
+        let hull = IsoExtrudedBox::new(36.0, 22.0, 10.0, Color::srgb(0.84, 0.66, 0.18))
+            .with_offset(Vec2::ZERO, 3.0)
+            .with_shadow(true);
+        let cab = IsoExtrudedBox::new(14.0, 18.0, 16.0, Color::srgb(0.84, 0.66, 0.18))
+            .with_offset(Vec2::new(-6.0, 0.0), 15.0)
+            .with_shadow(false);
+        let assembly = IsoBoxAssembly::new(vec![cab]);
+
+        // At screen point (-5, 20), both hull and cab are intersected by the camera ray, and
+        // cab's exit Z along the ray is higher (nearer to the camera) than hull's exit Z.
+        let hull_entry = OrderedBoxEntry::from_box(&pose, hull);
+        let cab_entry = OrderedBoxEntry::from_box(&pose, cab);
+        let hull_ray = hull_entry.ray_interval_at_screen_point(Vec2::new(-5.0, 20.0));
+        let cab_ray = cab_entry.ray_interval_at_screen_point(Vec2::new(-5.0, 20.0));
+        assert!(hull_ray.is_some());
+        assert!(cab_ray.is_some());
+        if let (Some((_, h_exit)), Some((c_enter, c_exit))) = (hull_ray, cab_ray) {
+            assert!(c_enter > h_exit);
+            assert!(c_exit > h_exit);
+        }
+
+        let mut ordered = Vec::new();
+        order_assembly_boxes_for_pose(&pose, &hull, Some(&assembly), &mut ordered);
+        assert_eq!(ordered.len(), 2);
+        // Hull (z0 = 3.0) must be ordered before Cab (z0 = 15.0) so Cab draws over Hull
+        assert!((ordered.first().map_or(0.0, |e| e.spec.z0) - 3.0).abs() < 1e-4);
+        assert!((ordered.get(1).map_or(0.0, |e| e.spec.z0) - 15.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_iso_mesh_cache_key_covers_all_geometry_and_style_inputs() {
+        let pose = WorldPose::new(Vec2::ZERO, 0.0, 0.0);
+        let base = IsoExtrudedBox::new(20.0, 14.0, 10.0, Color::srgb(0.5, 0.5, 0.5));
+        let part = IsoExtrudedBox::new(8.0, 6.0, 4.0, Color::srgb(0.7, 0.7, 0.7))
+            .with_offset(Vec2::new(2.0, 1.0), 10.0);
+        let asm = IsoBoxAssembly::new(vec![part]);
+        let baseline = IsoMeshCacheKey::compute(&pose, &base, Some(&asm));
+
+        // Changing length or width invalidates cache key
+        let diff_len = IsoExtrudedBox {
+            length: 24.0,
+            ..base
+        };
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &diff_len, Some(&asm))
+        );
+
+        let diff_wid = IsoExtrudedBox {
+            width: 18.0,
+            ..base
+        };
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &diff_wid, Some(&asm))
+        );
+
+        // Changing roof slope invalidates cache key
+        let diff_slope = base.with_roof_slope(RoofSlopeSpec::Gable {
+            eave_scale: 0.7,
+            ridge_scale: 1.2,
+        });
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &diff_slope, Some(&asm))
+        );
+
+        // Changing shadow flag invalidates cache key
+        let diff_shadow = base.with_shadow(true);
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &diff_shadow, Some(&asm))
+        );
+
+        // Changing assembly part rotation or alpha invalidates cache key
+        let rot_part = part.with_heading(0.35);
+        let rot_asm = IsoBoxAssembly::new(vec![rot_part]);
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &base, Some(&rot_asm))
+        );
+
+        let alpha_part = part.with_alpha(0.4);
+        let alpha_asm = IsoBoxAssembly::new(vec![alpha_part]);
+        assert_ne!(
+            baseline,
+            IsoMeshCacheKey::compute(&pose, &base, Some(&alpha_asm))
+        );
+    }
+
+    #[test]
+    fn test_sync_iso_meshes_reuses_buffers_and_clears_cached_aabb() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Mesh>()
+            .init_asset::<ColorMaterial>()
+            .init_resource::<SharedIsoColorMaterial>()
+            .add_systems(Update, sync_iso_extruded_box_meshes_system);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                WorldPose::new(Vec2::ZERO, 0.0, 0.0),
+                IsoExtrudedBox::new(20.0, 12.0, 8.0, Color::srgb(0.8, 0.6, 0.2)),
+                Aabb::default(),
+            ))
+            .id();
+
+        app.update();
+        assert!(app.world().entity(entity).get::<Mesh2d>().is_some());
+        assert!(app.world().entity(entity).get::<Aabb>().is_none());
+
+        // Re-insert a cached Aabb, rotate WorldPose to trigger an in-place mesh rebuild, and
+        // verify the stale Aabb is removed on rebuild.
+        app.world_mut().entity_mut(entity).insert(Aabb::default());
+        if let Some(mut pose) = app.world_mut().entity_mut(entity).get_mut::<WorldPose>() {
+            pose.heading_rad = 0.85;
+        }
+        app.update();
+        assert!(app.world().entity(entity).get::<Aabb>().is_none());
     }
 }

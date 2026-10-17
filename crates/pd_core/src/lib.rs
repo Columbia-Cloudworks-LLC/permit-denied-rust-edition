@@ -465,8 +465,36 @@ impl WorldPose {
 }
 
 /// Optional deterministic depth layer bias added when computing `iso_depth_key` for an entity.
+/// Ground/background and particle overlay layers use large offsets, whereas mutually occluding
+/// 3D world objects share `ISO_BIAS_WORLD_OBJECTS` (`10.0`) with tiny tie-break offsets (`<= 6e-4`)
+/// so world-space isometric depth `-(ground_iso.y)` always governs occlusion.
 #[derive(Component, Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct IsoLayerBias(pub f32);
+
+/// Base terrain backdrop layer bias (`-550.0`).
+pub const ISO_BIAS_GROUND_BACKDROP: f32 = -550.0;
+/// Base chunked isometric tilemap layer bias (`-480.0`).
+pub const ISO_BIAS_GROUND_TILES: f32 = -480.0;
+/// Dynamic ground decal / scar layer bias (`-420.0`).
+pub const ISO_BIAS_GROUND_DECALS: f32 = -420.0;
+/// Building interior floor slab layer bias (`-360.0`), above ground decals and below 3D world objects.
+pub const ISO_BIAS_INTERIOR_FLOOR: f32 = -360.0;
+/// Common base layer bias (`10.0`) shared by all mutually occluding 3D world objects.
+pub const ISO_BIAS_WORLD_OBJECTS: f32 = 10.0;
+/// Tie-break bias for structural debris chunks (`10.0001`).
+pub const ISO_BIAS_DEBRIS: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0001;
+/// Tie-break bias for interior furniture and exterior street props (`10.0002`).
+pub const ISO_BIAS_PROP: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0002;
+/// Tie-break bias for pedestrians (`10.0003`).
+pub const ISO_BIAS_PEDESTRIAN: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0003;
+/// Tie-break bias for traffic vehicles (`10.0004`).
+pub const ISO_BIAS_VEHICLE: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0004;
+/// Tie-break bias for modular buildings (`10.0005`).
+pub const ISO_BIAS_BUILDING: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0005;
+/// Tie-break bias for the player's armored bulldozer (`10.0006`).
+pub const ISO_BIAS_DOZER: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0006;
+/// Airborne particle burst / weather overlay layer bias (`120.0`).
+pub const ISO_BIAS_PARTICLES: f32 = 120.0;
 
 /// Projects Cartesian 2D world coordinates `(world_xy)` and vertical elevation `elev_z` into
 /// 2:1 isometric screen coordinates (`+X` world -> down-right `(2:1)`, `+Y` world -> down-left `(2:1)`,
@@ -494,14 +522,17 @@ pub fn iso_screen_to_world(screen_xy: Vec2, elev_z: f32) -> Vec2 {
 }
 
 /// Computes a deterministic painter's Z depth key in `[-800.0, 800.0]` from Cartesian `world_xy`,
-/// vertical `elev_z`, and `layer_bias`.
+/// vertical `elev_z`, and `layer_bias`. Positional isometric depth (`-ground_iso.y * 0.05`) spans
+/// `~50.0` units across the playable site so world position determines occlusion among objects
+/// sharing `ISO_BIAS_WORLD_OBJECTS`, while `layer_bias` separates ground/overlay layers and breaks
+/// exact ties.
 #[must_use]
 pub fn iso_depth_key(world_xy: Vec2, elev_z: f32, layer_bias: f32) -> f32 {
     let safe_xy = sanitize_vec2(world_xy, Vec2::ZERO);
     let safe_z = sanitize_f32(elev_z, 0.0).clamp(0.0, 500.0);
     let bias = sanitize_f32(layer_bias, 0.0);
     let ground_iso = world_to_iso_screen(safe_xy, 0.0);
-    let raw_z = bias - (ground_iso.y * 0.001) - (ground_iso.x * 0.00001) + (safe_z * 0.01);
+    let raw_z = bias - (ground_iso.y * 0.05) - (ground_iso.x * 0.00001) + (safe_z * 0.002);
     sanitize_f32(raw_z, 0.0).clamp(-800.0, 800.0)
 }
 
@@ -1061,5 +1092,16 @@ mod tests {
         assert!(nan_pose.pitch_rad.is_finite());
         assert!(nan_pose.roll_rad.is_finite());
         assert!(iso_depth_key(Vec2::splat(f32::NAN), f32::INFINITY, f32::NAN).is_finite());
+
+        // Cross-category occlusion: a building closer to the camera (higher x + y) must have a
+        // greater Z depth key than a dozer behind it, and vice versa when the dozer moves in front.
+        let building_pos = Vec2::new(0.0, 120.0);
+        let dozer_behind_pos = Vec2::new(0.0, 40.0);
+        let dozer_in_front_pos = Vec2::new(0.0, 180.0);
+        let building_z = iso_depth_key(building_pos, 0.0, ISO_BIAS_BUILDING);
+        let dozer_behind_z = iso_depth_key(dozer_behind_pos, 0.0, ISO_BIAS_DOZER);
+        let dozer_front_z = iso_depth_key(dozer_in_front_pos, 0.0, ISO_BIAS_DOZER);
+        assert!(building_z > dozer_behind_z);
+        assert!(dozer_front_z > building_z);
     }
 }

@@ -320,18 +320,31 @@ pub fn evaluate_dozer_structural_impacts_system(
                 task_pool,
             );
 
-            if let (Some(entry), Some(mut b_box), Some(mut asm)) =
-                (graph_registry.buildings.get(&b_entity), base_box, assembly)
-            {
-                let (mut new_base, mut new_asm) = build_building_iso_assembly(
-                    &entry.nodes,
-                    b_meta.stories,
-                    b_meta.palette_index,
-                );
-                new_base.alpha = cutaway.current_roof_alpha;
-                new_asm.alpha_multiplier = cutaway.current_roof_alpha;
-                *b_box = new_base;
-                *asm = new_asm;
+            if let Some(entry) = graph_registry.buildings.get(&b_entity) {
+                let has_intact_ground_story = entry
+                    .nodes
+                    .values()
+                    .any(|n| n.intact && n.story_level == 0);
+                if !has_intact_ground_story
+                    && let Some(mut b_cmds) = commands.get_entity(b_entity)
+                {
+                    b_cmds
+                        .remove::<RigidBody>()
+                        .remove::<Collider>()
+                        .remove::<Position>()
+                        .remove::<Rotation>();
+                }
+                if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
+                    let (mut new_base, mut new_asm) = build_building_iso_assembly(
+                        &entry.nodes,
+                        b_meta.stories,
+                        b_meta.palette_index,
+                    );
+                    new_base.alpha = cutaway.current_roof_alpha;
+                    new_asm.alpha_multiplier = cutaway.current_roof_alpha;
+                    *b_box = new_base;
+                    *asm = new_asm;
+                }
             }
         }
     }
@@ -815,12 +828,33 @@ mod tests {
             .iter(app.world())
             .count();
         assert_eq!(dozer_count, 1);
+        for (pose, pos, tf) in app
+            .world_mut()
+            .query_filtered::<(&WorldPose, &Position, &Transform), With<PlayerVehicle>>()
+            .iter(app.world())
+        {
+            assert!(pos.0.distance(pose.pos) < 1e-3);
+            let expected_screen = world_to_iso_screen(pose.pos, pose.elev_z);
+            assert!(tf.translation.truncate().distance(expected_screen) < 1e-3);
+        }
+
         let building_count = app
             .world_mut()
             .query_filtered::<Entity, With<ModularBuilding>>()
             .iter(app.world())
             .count();
         assert_eq!(building_count, 3);
+        for (pose, pos, tf) in app
+            .world_mut()
+            .query_filtered::<(&WorldPose, &Position, &Transform), With<ModularBuilding>>()
+            .iter(app.world())
+        {
+            assert!(pos.0.distance(pose.pos) < 1e-3);
+            let expected_screen = world_to_iso_screen(pose.pos, pose.elev_z);
+            assert!(tf.translation.truncate().distance(expected_screen) < 1e-3);
+            // Screen-space Y is non-equal to Cartesian Y for non-origin buildings!
+            assert!((pos.0.y - tf.translation.y).abs() > 1.0);
+        }
     }
 
     /// Epic #1 Verification Test: Verifies that `WorldPose` decoupling (#7), 2:1 isometric

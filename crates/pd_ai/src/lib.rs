@@ -9,9 +9,9 @@ use bevy::prelude::*;
 use pd_core::{
     ActiveCollapseZones, AppState, AudioSfxKind, AudioTriggerEvent, CashPopupPool, CollapseZone,
     DebugTelemetry, DecalKind, DecalSpawnRequest, DemolitionCashEvent, EnvironmentConfig, GameMode,
-    IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, PdSystemSet, SessionEpoch, SiteScoped, WorldPose,
-    iso_depth_key, iso_screen_to_world, sanitize_dt, sanitize_f32, sanitize_vec2,
-    world_to_iso_screen,
+    ISO_BIAS_PEDESTRIAN, ISO_BIAS_VEHICLE, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
+    PdSystemSet, SessionEpoch, SiteScoped, WorldPose, iso_depth_key, iso_screen_to_world,
+    sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
 };
 use pd_world::{RoadSplineGraph, SpatialHashGrid};
 use serde::{Deserialize, Serialize};
@@ -498,6 +498,7 @@ pub fn update_crowd_and_traffic_spatial_grid(
 
 /// System wrapper evaluating spatial grid threats in Cartesian `WorldPose` space and applying
 /// agent velocities, road spline progression, oil slick decals, and spline-to-physics transitions.
+#[allow(clippy::type_complexity)]
 pub fn fixed_crowd_and_traffic_ai_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -515,6 +516,8 @@ pub fn fixed_crowd_and_traffic_ai_system(
         Entity,
         &mut AgentState,
         Option<&mut WorldPose>,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
         &mut Transform,
         Option<&mut IsoExtrudedBox>,
         Option<&mut IsoBoxAssembly>,
@@ -532,7 +535,7 @@ pub fn fixed_crowd_and_traffic_ai_system(
     );
 
     spatial_grid.clear();
-    for (entity, _, world_pose, transform, _, _, _) in agents.iter() {
+    for (entity, _, world_pose, _, _, transform, _, _, _) in agents.iter() {
         let pos = world_pose
             .map_or_else(|| transform.translation.truncate(), |p| p.pos);
         spatial_grid.insert(entity, sanitize_vec2(pos, Vec2::ZERO));
@@ -590,7 +593,7 @@ pub fn fixed_crowd_and_traffic_ai_system(
             escape_dir
         };
 
-        if let Ok((_, mut state, _, _, base_box, assembly, _)) = agents.get_mut(entity) {
+        if let Ok((_, mut state, _, _, _, _, base_box, assembly, _)) = agents.get_mut(entity) {
             match *state {
                 AgentState::PedestrianStroll { .. } | AgentState::PedestrianPanic { .. } => {
                     let was_stroll = matches!(*state, AgentState::PedestrianStroll { .. });
@@ -633,8 +636,17 @@ pub fn fixed_crowd_and_traffic_ai_system(
     let mut panicked_count: usize = 0;
 
     // Apply locomotion and spline-to-physics transitions in Cartesian WorldPose space.
-    for (entity, mut state, mut world_pose, mut transform, base_box, assembly, spline_follower) in
-        &mut agents
+    for (
+        entity,
+        mut state,
+        mut world_pose,
+        mut phys_pos,
+        mut phys_rot,
+        mut transform,
+        base_box,
+        assembly,
+        spline_follower,
+    ) in &mut agents
     {
         match *state {
             AgentState::PedestrianStroll { velocity, facing } => {
@@ -714,6 +726,7 @@ pub fn fixed_crowd_and_traffic_ai_system(
                     let pos_xy = world_pose
                         .as_deref()
                         .map_or_else(|| transform.translation.truncate(), |p| p.pos);
+                    let heading = world_pose.as_deref().map_or(0.0, |p| p.heading_rad);
                     let screen_xy = world_to_iso_screen(pos_xy, 8.0);
                     cash_events.send(DemolitionCashEvent {
                         amount: archetype.cash_value(),
@@ -736,6 +749,8 @@ pub fn fixed_crowd_and_traffic_ai_system(
                     if let Some(mut e_cmds) = commands.get_entity(entity) {
                         e_cmds.remove::<SplineFollower>().insert((
                             DynamicPhysicsVehicle,
+                            Position(pos_xy),
+                            Rotation::radians(heading),
                             RigidBody::Dynamic,
                             Collider::rectangle(34.0, 18.0),
                             LinearVelocity::default(),
@@ -744,6 +759,9 @@ pub fn fixed_crowd_and_traffic_ai_system(
                     }
                 } else {
                     if let Some(pose) = world_pose.as_deref_mut() {
+                        if let Some(pos) = phys_pos.as_deref() {
+                            pose.pos = sanitize_vec2(pos.0, pose.pos);
+                        }
                         pose.pos = sanitize_vec2(pose.pos + clamped_vel * dt, pose.pos);
                         if clamped_vel.length_squared() > 9.0 {
                             pose.heading_rad =
@@ -751,6 +769,12 @@ pub fn fixed_crowd_and_traffic_ai_system(
                             pose.roll_rad = 0.14;
                         } else {
                             pose.roll_rad = 0.05;
+                        }
+                        if let Some(pos) = phys_pos.as_deref_mut() {
+                            pos.0 = pose.pos;
+                        }
+                        if let Some(rot) = phys_rot.as_deref_mut() {
+                            *rot = Rotation::radians(pose.heading_rad);
                         }
                     }
                     *knockback_velocity = sanitize_vec2(clamped_vel * 0.92, Vec2::ZERO);
@@ -783,7 +807,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
         let facing = Facing8Way::from_velocity(stroll_vel);
         let heading = facing.to_heading_radians();
         let iso_xy = world_to_iso_screen(pos, 0.0);
-        let iso_z = iso_depth_key(pos, 4.0, 8.0);
+        let iso_z = iso_depth_key(pos, 4.0, ISO_BIAS_PEDESTRIAN);
         let (ped_base, ped_asm) = build_pedestrian_iso_assembly(false, i);
 
         commands.spawn((
@@ -794,7 +818,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
                 facing,
             },
             WorldPose::new(pos, 0.0, heading),
-            IsoLayerBias(8.0),
+            IsoLayerBias(ISO_BIAS_PEDESTRIAN),
             ped_base,
             ped_asm,
             Transform::from_xyz(iso_xy.x, iso_xy.y, iso_z),
@@ -841,7 +865,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
         let dir = (target_xy - spawn_xy).normalize_or_zero();
         let heading = sanitize_f32(dir.y.atan2(dir.x), 0.0);
         let iso_xy = world_to_iso_screen(spawn_xy, 0.0);
-        let iso_z = iso_depth_key(spawn_xy, 8.0, 9.0);
+        let iso_z = iso_depth_key(spawn_xy, 8.0, ISO_BIAS_VEHICLE);
         let (veh_base, veh_asm) = build_vehicle_iso_assembly(archetype, false);
 
         commands.spawn((
@@ -858,7 +882,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
                 halted_by_rubble: false,
             },
             WorldPose::new(spawn_xy, 0.0, heading),
-            IsoLayerBias(9.0),
+            IsoLayerBias(ISO_BIAS_VEHICLE),
             veh_base,
             veh_asm,
             Transform::from_xyz(iso_xy.x, iso_xy.y, iso_z),
@@ -879,8 +903,10 @@ impl Plugin for PdAiPlugin {
             Update,
             ensure_site_crowd_and_traffic_spawned_system
                 .run_if(in_state(AppState::Playing))
-                .after(PdSystemSet::InputAndClock)
-                .before(PdSystemSet::WorldTilemapSync),
+                .in_set(PdSystemSet::WorldTilemapSync)
+                .after(pd_world::sync_world_on_site_restart_system)
+                .before(pd_world::ensure_site_ground_spawned_system)
+                .before(pd_world::project_world_poses_to_isometric_transform_system),
         )
         .add_systems(
             FixedUpdate,
@@ -895,6 +921,9 @@ impl Plugin for PdAiPlugin {
 mod tests {
     use super::*;
     use bevy::ecs::system::SystemState;
+    use bevy::state::app::StatesPlugin;
+    use pd_core::{CampaignLevel, PdCorePlugin, SiteRestartRequested};
+    use pd_world::PdWorldPlugin;
 
     #[test]
     fn test_zero_distance_threat_produces_finite_escape_vector() {
@@ -952,5 +981,54 @@ mod tests {
             );
             assert!(is_dynamic);
         }
+    }
+
+    #[test]
+    fn test_traffic_spawns_from_rebuilt_road_spline_graph_on_restart() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin))
+            .add_plugins((PdCorePlugin, PdWorldPlugin, PdAiPlugin));
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        app.update();
+        app.update();
+
+        // Now change CampaignLevel to CityDowntown6 (half_span = 260 + 6 * 32 = 452.0) and trigger restart
+        app.world_mut().resource_mut::<EnvironmentConfig>().level = CampaignLevel::CityDowntown6;
+        app.world_mut().send_event(SiteRestartRequested {
+            preserve_layout: false,
+        });
+        app.update();
+
+        let expected_nodes: Vec<Vec2> = app
+            .world()
+            .resource::<RoadSplineGraph>()
+            .nodes
+            .iter()
+            .map(|n| n.position)
+            .collect();
+        assert_eq!(expected_nodes.len(), 8);
+        assert!((expected_nodes.first().map_or(0.0, |v| v.x) - (-452.0)).abs() < 1e-3);
+
+        // Verify all 5 traffic vehicles spawned in the SAME frame as the site restart use the rebuilt
+        // CityDowntown6 RoadSplineGraph node positions (not the previous County1 250.0 extent!).
+        let mut vehicle_poses: Vec<Vec2> = app
+            .world_mut()
+            .query_filtered::<&WorldPose, With<SplineFollower>>()
+            .iter(app.world())
+            .map(|p| p.pos)
+            .collect();
+        assert_eq!(vehicle_poses.len(), 5);
+        for expected in expected_nodes.iter().take(5) {
+            assert!(
+                vehicle_poses
+                    .iter()
+                    .any(|p| p.distance_squared(*expected) < 1e-3),
+                "Expected vehicle at rebuilt spline node {expected:?}, got {vehicle_poses:?}"
+            );
+        }
+        vehicle_poses.clear();
     }
 }
