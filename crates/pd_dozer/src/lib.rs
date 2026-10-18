@@ -162,7 +162,8 @@ impl PlayerVehicle {
                 let shear_mul = sanitize_f32(raw_mul, 1.0).clamp(1.0, MAX_SAFE_MULTIPLIER);
                 let carry = sanitize_f32(self.blade_shear_carry, 0.0).clamp(-0.5, 0.5);
                 let exact_nodes = 2.0 * shear_mul + carry;
-                let rounded = sanitize_f32(exact_nodes.round(), 2.0).clamp(2.0, 12.0);
+                let max_shear_nodes = 2.0 * MAX_SAFE_MULTIPLIER;
+                let rounded = sanitize_f32(exact_nodes.round(), 2.0).clamp(2.0, max_shear_nodes);
                 self.blade_shear_carry =
                     sanitize_f32(exact_nodes - rounded, 0.0).clamp(-0.5, 0.5);
                 rounded as usize
@@ -780,7 +781,7 @@ pub fn compute_skid_steer_kinematics(
         let base_target = if throttle > 0.0 {
             BASE_TOP_SPEED * engine_mul * throttle.min(1.0)
         } else {
-            BASE_MAX_REVERSE_SPEED * throttle.max(-1.0)
+            BASE_MAX_REVERSE_SPEED * engine_mul * throttle.max(-1.0)
         };
         let target = base_target * reach * breakdown_factor;
         let scrubbing = scrub > 0.0
@@ -792,7 +793,7 @@ pub fn compute_skid_steer_kinematics(
         } else if throttle > 0.0 {
             DOZER_ACCEL * engine_mul
         } else {
-            DOZER_REVERSE_ACCEL
+            DOZER_REVERSE_ACCEL * engine_mul
         };
         let stepped = approach_f32(along, target, acc * safe_dt);
         if push_active_for_step && throttle > 0.0 {
@@ -808,7 +809,7 @@ pub fn compute_skid_steer_kinematics(
 
     // 6. Cap forward or reverse top speed (`capDozerSpeed` in `dozer.ts`) from resulting travel direction.
     let max_speed = if next_along < 0.0 {
-        BASE_MAX_REVERSE_SPEED * breakdown_factor
+        BASE_MAX_REVERSE_SPEED * engine_mul * breakdown_factor
     } else {
         BASE_TOP_SPEED
             * engine_mul
@@ -1810,23 +1811,51 @@ mod tests {
         let mut upgrades = UpgradeMultipliers::default();
         let mut prog = UpgradeProgression::default();
 
-        // Verify each AR400 Edge level (0 -> 1 -> 2 -> 3) strictly increases single-hit & multi-hit node shear
+        // Verify each AR400 Edge level (0 -> 1 -> 2 -> 3) and beyond 12 picks (15, 30, 60) scales node shear up to 50
         let mut veh0 = PlayerVehicle::default();
         let mut veh1 = PlayerVehicle::default();
         let mut veh2 = PlayerVehicle::default();
         let mut veh3 = PlayerVehicle::default();
+        let mut veh15 = PlayerVehicle::default();
+        let mut veh30 = PlayerVehicle::default();
+        let mut veh60 = PlayerVehicle::default();
         let up0 = UpgradeMultipliers::from_levels(0, 0, 0);
         let up1 = UpgradeMultipliers::from_levels(1, 0, 0);
         let up2 = UpgradeMultipliers::from_levels(2, 0, 0);
         let up3 = UpgradeMultipliers::from_levels(3, 0, 0);
-        let n0 = veh0.consume_blade_shear_nodes(BladeState::BladeDown, &up0);
-        let n1 = veh1.consume_blade_shear_nodes(BladeState::BladeDown, &up1);
-        let n2 = veh2.consume_blade_shear_nodes(BladeState::BladeDown, &up2);
-        let n3 = veh3.consume_blade_shear_nodes(BladeState::BladeDown, &up3);
-        assert_eq!(n0, 2);
-        assert_eq!(n1, 3);
-        assert_eq!(n2, 4);
-        assert_eq!(n3, 5);
+        let up15 = UpgradeMultipliers::from_levels(15, 0, 0);
+        let up30 = UpgradeMultipliers::from_levels(30, 0, 0);
+        let up60 = UpgradeMultipliers::from_levels(60, 0, 0);
+        assert_eq!(veh0.consume_blade_shear_nodes(BladeState::BladeDown, &up0), 2);
+        assert_eq!(veh1.consume_blade_shear_nodes(BladeState::BladeDown, &up1), 3);
+        assert_eq!(veh2.consume_blade_shear_nodes(BladeState::BladeDown, &up2), 4);
+        assert_eq!(veh3.consume_blade_shear_nodes(BladeState::BladeDown, &up3), 5);
+        assert_eq!(veh15.consume_blade_shear_nodes(BladeState::BladeDown, &up15), 15);
+        assert_eq!(veh30.consume_blade_shear_nodes(BladeState::BladeDown, &up30), 27);
+        assert_eq!(veh60.consume_blade_shear_nodes(BladeState::BladeDown, &up60), 50);
+
+        // Verify Charge-Air Kit (+28% per level) scales both reverse acceleration and reverse top speed
+        let mut stress = MechanicalStress {
+            sandbox_mode: true,
+            ..MechanicalStress::default()
+        };
+        let dt = 1.0 / 60.0;
+        let base_engine = UpgradeMultipliers::from_levels(0, 0, 0);
+        let upgraded_engine = UpgradeMultipliers::from_levels(0, 2, 0); // 1.56x engine multiplier
+        let mut rev_base = TrackInput::from_throttle_steer(-1.0, 0.0, false);
+        let mut rev_upgraded = TrackInput::from_throttle_steer(-1.0, 0.0, false);
+        let _ = step_virtual_dozer(&mut rev_base, &base_engine, &mut stress, dt);
+        let _ = step_virtual_dozer(&mut rev_upgraded, &upgraded_engine, &mut stress, dt);
+        assert!(rev_upgraded.vx < rev_base.vx - 0.5);
+        for _ in 0..180 {
+            let _ = step_virtual_dozer(&mut rev_base, &base_engine, &mut stress, dt);
+            let _ = step_virtual_dozer(&mut rev_upgraded, &upgraded_engine, &mut stress, dt);
+        }
+        assert!((rev_base.vx.abs() - BASE_MAX_REVERSE_SPEED).abs() < 0.5);
+        assert!(
+            (rev_upgraded.vx.abs() - BASE_MAX_REVERSE_SPEED * upgraded_engine.charge_air_kit).abs()
+                < 0.5
+        );
 
         // Cross first milestone ($350) in Campaign mode
         assert_eq!(prog.evaluate_cash_milestones(350), 1);

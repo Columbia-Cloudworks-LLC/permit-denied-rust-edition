@@ -291,9 +291,11 @@ pub fn evaluate_dozer_structural_impacts_system(
             continue;
         }
 
-        let max_nodes_per_hit = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
         destroyed_ids.clear();
-        if let Some(entry) = graph_registry.buildings.get(&b_entity) {
+        if let Some(entry) = graph_registry.buildings.get(&b_entity)
+            && entry.nodes.values().any(|n| n.intact && n.story_level == 0)
+        {
+            let max_nodes_per_hit = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
             for (&id, node) in &entry.nodes {
                 if node.intact && node.story_level == 0 {
                     destroyed_ids.push(id);
