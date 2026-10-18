@@ -269,7 +269,7 @@ pub fn evaluate_dozer_structural_impacts_system(
         .max(upgrades.sanitized().aux_ram)
         .clamp(1.0, pd_dozer::MAX_SAFE_MULTIPLIER);
     let slam_bonus = if dozer_veh.blade_landed_this_tick {
-        10.0 * push_force_mul
+        10.0
     } else {
         0.0
     };
@@ -399,6 +399,7 @@ pub fn evaluate_dozer_structural_impacts_system(
             .any(|pt| pt.distance_squared(p_xy) <= p_hit_radius * p_hit_radius);
         if blade_hit || dozer_xy.distance_squared(p_xy) <= 42.0 * 42.0 {
             contact_load += 0.35;
+            let prop_recoil_bounce = (0.08 / push_force_mul).clamp(0.015, 0.08);
             let veh = &mut *dozer_veh;
             let mut pos_mut = dozer_xy;
             let mut vel_mut = Vec2::new(veh.vx, veh.vy);
@@ -411,7 +412,7 @@ pub fn evaluate_dozer_structural_impacts_system(
                 &mut veh.last_impact,
                 (dozer_xy - p_xy).normalize_or_zero(),
                 0.0,
-                0.08,
+                prop_recoil_bounce,
             );
             veh.vx = vel_mut.x;
             veh.vy = vel_mut.y;
@@ -1108,6 +1109,39 @@ mod tests {
         }
         let scars_after = app.world().resource::<GroundDecalPool>().total_crushed_scars;
         assert!(scars_after > initial_scars);
+
+        // Verify that high Aux Ram (`25.0x`) on a blade-landing tick does NOT inflate the contact radius
+        // to crush distant rubble (e.g., 120.0 units ahead of the dozer center).
+        app.world_mut().resource_mut::<UpgradeMultipliers>().aux_ram = pd_dozer::MAX_SAFE_MULTIPLIER;
+        for mut veh in app
+            .world_mut()
+            .query::<&mut PlayerVehicle>()
+            .iter_mut(app.world_mut())
+        {
+            veh.pushing_force_multiplier = pd_dozer::MAX_SAFE_MULTIPLIER;
+            veh.blade_landed_this_tick = true;
+        }
+        let far_rubble = app
+            .world_mut()
+            .spawn((
+                SiteScoped { epoch },
+                DebrisTier::SleepingInstanced,
+                DebrisChunk {
+                    tier: DebrisTier::SleepingInstanced,
+                    active_timer_secs: 0.0,
+                    simulated_z_height: 0.0,
+                    vertical_z_velocity: 0.0,
+                    horizontal_velocity: Vec2::ZERO,
+                    spin_rate: 0.0,
+                },
+                WorldPose::from_xy(120.0, -60.0),
+                Transform::from_xyz(120.0, -60.0, 0.0),
+                GlobalTransform::default(),
+            ))
+            .id();
+        app.update();
+        assert!(app.world().get_entity(far_rubble).is_ok());
+        app.world_mut().resource_mut::<UpgradeMultipliers>().aux_ram = 1.0;
 
         // 4. Verify selecting an upgrade while paused in Sandbox mode preserves AppState::Paused
         app.world_mut().resource_mut::<EnvironmentConfig>().mode = pd_core::GameMode::Sandbox;
