@@ -9,12 +9,13 @@ use bevy::tasks::AsyncComputeTaskPool;
 use pd_ai::PdAiPlugin;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, DebugTelemetry, DecalKind, DecalSpawnRequest,
-    DemolitionCashEvent, ParticleBurstEvent, ParticleBurstKind, PdCorePlugin, PdSystemSet,
-    SessionEpoch, sanitize_f32, sanitize_vec2,
+    DemolitionCashEvent, IsoBoxAssembly, IsoExtrudedBox, ParticleBurstEvent, ParticleBurstKind,
+    PdCorePlugin, PdSystemSet, SessionEpoch, WorldPose, sanitize_f32, sanitize_vec2,
+    world_to_iso_screen,
 };
 use pd_destruction::{
     BuildingGraphRegistry, DebrisChunk, DebrisPoolRegistry, DebrisTier, DestructibleProp,
-    ModularBuilding, NodeIndex, PdDestructionPlugin, PropArchetype,
+    ModularBuilding, NodeIndex, PdDestructionPlugin, PropArchetype, build_building_iso_assembly,
     queue_structural_integrity_evaluation, spawn_pooled_debris_chunk,
 };
 use pd_dozer::{BladeState, PdDozerPlugin, PlayerVehicle, TrackInput, UpgradeMultipliers};
@@ -155,38 +156,59 @@ fn setup_isometric_camera_system(
     info!("Isometric 2.5D camera initialized; entering main loop.");
 }
 
-/// Smoothly follows the armored bulldozer and updates interior cutaway opacity when the dozer
-/// breaches or enters a building footprint.
+/// Smoothly follows the armored bulldozer in isometric screen space while evaluating building
+/// interior cutaway opacity in Cartesian `WorldPose` space.
 fn camera_follow_and_cutaway_system(
     time: Res<Time>,
-    dozer_query: Query<&Transform, (With<PlayerVehicle>, Without<IsometricCamera>)>,
+    dozer_query: Query<(Option<&WorldPose>, &Transform), (With<PlayerVehicle>, Without<IsometricCamera>)>,
     mut cam_query: Query<&mut Transform, (With<IsometricCamera>, Without<PlayerVehicle>)>,
     mut cutaways: Query<
-        (&mut CutawayFootprint, &mut Sprite),
+        (
+            &mut CutawayFootprint,
+            Option<&mut Sprite>,
+            Option<&mut IsoExtrudedBox>,
+            Option<&mut IsoBoxAssembly>,
+        ),
         (Without<PlayerVehicle>, Without<IsometricCamera>),
     >,
 ) {
     let dt = sanitize_f32(time.delta_secs(), 0.016).clamp(0.0001, 0.05);
-    let Ok(dozer_tf) = dozer_query.get_single() else {
+    let Ok((dozer_pose, dozer_tf)) = dozer_query.get_single() else {
         return;
     };
-    let dozer_xy = sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO);
+    let dozer_world_xy = dozer_pose.map_or_else(
+        || sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO),
+        |p| sanitize_vec2(p.pos, Vec2::ZERO),
+    );
+    let dozer_screen_xy = dozer_pose.map_or_else(
+        || sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO),
+        |p| world_to_iso_screen(p.pos, p.elev_z),
+    );
 
     if let Ok(mut cam_tf) = cam_query.get_single_mut() {
         let current_xy = sanitize_vec2(cam_tf.translation.truncate(), Vec2::ZERO);
-        let next_xy = current_xy + (dozer_xy - current_xy) * (6.0 * dt).clamp(0.0, 1.0);
+        let next_xy = current_xy + (dozer_screen_xy - current_xy) * (6.0 * dt).clamp(0.0, 1.0);
         cam_tf.translation.x = sanitize_f32(next_xy.x, current_xy.x);
         cam_tf.translation.y = sanitize_f32(next_xy.y, current_xy.y);
     }
 
-    for (mut footprint, mut sprite) in &mut cutaways {
-        footprint.update_alpha(dozer_xy, dt);
-        sprite.color = sprite.color.with_alpha(footprint.current_roof_alpha);
+    for (mut footprint, sprite, base_box, assembly) in &mut cutaways {
+        footprint.update_alpha(dozer_world_xy, dt);
+        if let Some(mut sp) = sprite {
+            sp.color = sp.color.with_alpha(footprint.current_roof_alpha);
+        }
+        if let Some(mut b_box) = base_box {
+            b_box.alpha = footprint.current_roof_alpha;
+        }
+        if let Some(mut asm) = assembly {
+            asm.alpha_multiplier = footprint.current_roof_alpha;
+        }
     }
 }
 
 /// Evaluates dozer blade impacts against modular buildings, interior/exterior props, and sleeping
-/// rubble (crushing Tier 2 sleeping rubble into Tier 3 ground decal scars when `BladeDown`).
+/// rubble in Cartesian `WorldPose` space (crushing Tier 2 sleeping rubble into Tier 3 ground
+/// decal scars when `BladeDown`).
 pub fn evaluate_dozer_structural_impacts_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
@@ -199,17 +221,26 @@ pub fn evaluate_dozer_structural_impacts_system(
     mut decal_events: EventWriter<DecalSpawnRequest>,
     mut particle_events: EventWriter<ParticleBurstEvent>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
-    dozer_query: Query<&Transform, With<PlayerVehicle>>,
+    mut destroyed_ids: Local<Vec<NodeIndex>>,
+    dozer_query: Query<(Option<&WorldPose>, &Transform), With<PlayerVehicle>>,
     mut building_query: Query<
-        (Entity, &Transform, &mut CutawayFootprint),
+        (
+            Entity,
+            Option<&WorldPose>,
+            &Transform,
+            &ModularBuilding,
+            &mut CutawayFootprint,
+            Option<&mut IsoExtrudedBox>,
+            Option<&mut IsoBoxAssembly>,
+        ),
         (With<ModularBuilding>, Without<PlayerVehicle>),
     >,
     prop_query: Query<
-        (Entity, &Transform, &DestructibleProp),
+        (Entity, Option<&WorldPose>, &Transform, &DestructibleProp),
         (Without<PlayerVehicle>, Without<ModularBuilding>),
     >,
     mut sleeping_rubble_query: Query<
-        (Entity, &Transform, &mut DebrisChunk),
+        (Entity, Option<&WorldPose>, &Transform, &mut DebrisChunk),
         (
             Without<PlayerVehicle>,
             Without<ModularBuilding>,
@@ -217,10 +248,13 @@ pub fn evaluate_dozer_structural_impacts_system(
         ),
     >,
 ) {
-    let Ok(dozer_tf) = dozer_query.get_single() else {
+    let Ok((dozer_pose, dozer_tf)) = dozer_query.get_single() else {
         return;
     };
-    let dozer_xy = sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO);
+    let dozer_xy = dozer_pose.map_or_else(
+        || sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO),
+        |p| sanitize_vec2(p.pos, Vec2::ZERO),
+    );
     let task_pool = AsyncComputeTaskPool::get();
 
     let max_nodes_per_hit: usize = match *blade_state {
@@ -231,13 +265,16 @@ pub fn evaluate_dozer_structural_impacts_system(
     let mut contact_load = 0.0_f32;
 
     // 1. Evaluate building structural impacts
-    for (b_entity, b_tf, mut cutaway) in &mut building_query {
-        let b_xy = sanitize_vec2(b_tf.translation.truncate(), Vec2::ZERO);
+    for (b_entity, b_pose, b_tf, b_meta, mut cutaway, base_box, assembly) in &mut building_query {
+        let b_xy = b_pose.map_or_else(
+            || sanitize_vec2(b_tf.translation.truncate(), Vec2::ZERO),
+            |p| sanitize_vec2(p.pos, Vec2::ZERO),
+        );
         if dozer_xy.distance_squared(b_xy) > 95.0 * 95.0 {
             continue;
         }
 
-        let mut destroyed_ids: Vec<NodeIndex> = Vec::new();
+        destroyed_ids.clear();
         if let Some(entry) = graph_registry.buildings.get(&b_entity) {
             for (&id, node) in &entry.nodes {
                 if node.intact && node.story_level == 0 {
@@ -261,6 +298,7 @@ pub fn evaluate_dozer_structural_impacts_system(
                 count: 5,
             });
 
+            let b_screen = world_to_iso_screen(b_xy, 8.0);
             for &id in &destroyed_ids {
                 let cash_val = graph_registry
                     .buildings
@@ -270,7 +308,7 @@ pub fn evaluate_dozer_structural_impacts_system(
 
                 cash_events.send(DemolitionCashEvent {
                     amount: cash_val,
-                    world_pos: b_xy.extend(0.0),
+                    world_pos: b_screen.extend(0.0),
                 });
                 spawn_pooled_debris_chunk(&mut commands, &mut debris_pool, *epoch, b_xy, 0);
             }
@@ -281,17 +319,48 @@ pub fn evaluate_dozer_structural_impacts_system(
                 &mut graph_registry,
                 task_pool,
             );
+
+            if let Some(entry) = graph_registry.buildings.get(&b_entity) {
+                let has_intact_ground_story = entry
+                    .nodes
+                    .values()
+                    .any(|n| n.intact && n.story_level == 0);
+                if !has_intact_ground_story
+                    && let Some(mut b_cmds) = commands.get_entity(b_entity)
+                {
+                    b_cmds
+                        .remove::<RigidBody>()
+                        .remove::<Collider>()
+                        .remove::<Position>()
+                        .remove::<Rotation>();
+                }
+                if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
+                    let (mut new_base, mut new_asm) = build_building_iso_assembly(
+                        &entry.nodes,
+                        b_meta.stories,
+                        b_meta.palette_index,
+                    );
+                    new_base.alpha = cutaway.current_roof_alpha;
+                    new_asm.alpha_multiplier = cutaway.current_roof_alpha;
+                    *b_box = new_base;
+                    *asm = new_asm;
+                }
+            }
         }
     }
 
     // 2. Evaluate interior furniture & exterior street prop destruction
-    for (prop_entity, prop_tf, prop) in &prop_query {
-        let p_xy = sanitize_vec2(prop_tf.translation.truncate(), Vec2::ZERO);
+    for (prop_entity, prop_pose, prop_tf, prop) in &prop_query {
+        let p_xy = prop_pose.map_or_else(
+            || sanitize_vec2(prop_tf.translation.truncate(), Vec2::ZERO),
+            |p| sanitize_vec2(p.pos, Vec2::ZERO),
+        );
         if dozer_xy.distance_squared(p_xy) <= 42.0 * 42.0 {
             contact_load += 0.35;
+            let p_screen = world_to_iso_screen(p_xy, 4.0);
             cash_events.send(DemolitionCashEvent {
                 amount: prop.archetype.cash_value(),
-                world_pos: p_xy.extend(0.0),
+                world_pos: p_screen.extend(0.0),
             });
 
             match prop.archetype {
@@ -340,13 +409,16 @@ pub fn evaluate_dozer_structural_impacts_system(
     }
 
     // 3. Tier 2 -> Tier 3 Heightmap Crushing: Driving over sleeping rubble with BladeDown
-    // flattens the sprites into the persistent ground decal layer.
+    // flattens the rubble into the persistent ground decal layer.
     if *blade_state == BladeState::BladeDown {
-        for (rubble_entity, rubble_tf, mut chunk) in &mut sleeping_rubble_query {
+        for (rubble_entity, rubble_pose, rubble_tf, mut chunk) in &mut sleeping_rubble_query {
             if chunk.tier != DebrisTier::SleepingInstanced {
                 continue;
             }
-            let r_xy = sanitize_vec2(rubble_tf.translation.truncate(), Vec2::ZERO);
+            let r_xy = rubble_pose.map_or_else(
+                || sanitize_vec2(rubble_tf.translation.truncate(), Vec2::ZERO),
+                |p| sanitize_vec2(p.pos, Vec2::ZERO),
+            );
             if dozer_xy.distance_squared(r_xy) <= 38.0 * 38.0 {
                 chunk.tier = DebrisTier::CrushedDecal;
                 debris_pool.active_ring.retain(|&e| e != rubble_entity);
@@ -646,7 +718,10 @@ mod tests {
                 active_timer_secs: 0.0,
                 simulated_z_height: 0.0,
                 vertical_z_velocity: 0.0,
+                horizontal_velocity: Vec2::ZERO,
+                spin_rate: 0.0,
             },
+            WorldPose::from_xy(0.0, -60.0),
             Transform::from_xyz(0.0, -60.0, 0.0),
             GlobalTransform::default(),
         ));
@@ -680,6 +755,7 @@ mod tests {
         .init_asset::<Image>()
         .init_asset::<TextureAtlasLayout>()
         .init_asset::<Mesh>()
+        .init_asset::<ColorMaterial>()
         .add_plugins(PhysicsPlugins::default().with_length_unit(16.0))
         .insert_resource(Gravity(Vec2::ZERO))
         .init_resource::<SynthesizedAudioBank>()
@@ -752,12 +828,103 @@ mod tests {
             .iter(app.world())
             .count();
         assert_eq!(dozer_count, 1);
+        for (pose, pos, tf) in app
+            .world_mut()
+            .query_filtered::<(&WorldPose, &Position, &Transform), With<PlayerVehicle>>()
+            .iter(app.world())
+        {
+            assert!(pos.0.distance(pose.pos) < 1e-3);
+            let expected_screen = world_to_iso_screen(pose.pos, pose.elev_z);
+            assert!(tf.translation.truncate().distance(expected_screen) < 1e-3);
+        }
+
         let building_count = app
             .world_mut()
             .query_filtered::<Entity, With<ModularBuilding>>()
             .iter(app.world())
             .count();
         assert_eq!(building_count, 3);
+        for (pose, pos, tf) in app
+            .world_mut()
+            .query_filtered::<(&WorldPose, &Position, &Transform), With<ModularBuilding>>()
+            .iter(app.world())
+        {
+            assert!(pos.0.distance(pose.pos) < 1e-3);
+            let expected_screen = world_to_iso_screen(pose.pos, pose.elev_z);
+            assert!(tf.translation.truncate().distance(expected_screen) < 1e-3);
+            // Screen-space Y is non-equal to Cartesian Y for non-origin buildings!
+            assert!((pos.0.y - tf.translation.y).abs() > 1.0);
+        }
+    }
+
+    /// Epic #1 Verification Test: Verifies that `WorldPose` decoupling (#7), 2:1 isometric
+    /// diamond ground/decal meshes (#8), `IsoExtrudedBox` 2.5D meshes with upper-west sun
+    /// lighting (#9), and multi-part `IsoBoxAssembly` visuals on the dozer, buildings, props,
+    /// vehicles, pedestrians, and debris (#10) are spawned and synchronized accurately.
+    #[test]
+    fn test_epic_1_isometric_projection_and_extruded_meshes() {
+        let _task_pool = AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().build());
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            StatesPlugin,
+            TransformPlugin,
+            HierarchyPlugin,
+        ))
+        .init_asset::<Image>()
+        .init_asset::<TextureAtlasLayout>()
+        .init_asset::<Mesh>()
+        .init_asset::<ColorMaterial>()
+        .add_plugins((
+            PdCorePlugin,
+            PdWorldPlugin,
+            PdDozerPlugin,
+            PdDestructionPlugin,
+            PdAiPlugin,
+            PdUiPlugin,
+        ));
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        for _ in 0..4 {
+            app.update();
+        }
+
+        // Verify dozer has WorldPose, IsoExtrudedBox, IsoBoxAssembly, Mesh2d, and IsoMeshCacheKey
+        let mut dozer_q = app.world_mut().query_filtered::<(
+            &WorldPose,
+            &Transform,
+            &IsoExtrudedBox,
+            &IsoBoxAssembly,
+            &Mesh2d,
+            &pd_world::IsoMeshCacheKey,
+        ), With<PlayerVehicle>>();
+        let dozer_item = dozer_q.iter(app.world()).next();
+        assert!(dozer_item.is_some());
+        if let Some((pose, tf, _, asm, _, cache_key)) = dozer_item {
+            let expected_screen = world_to_iso_screen(pose.pos, pose.elev_z);
+            assert!((tf.translation.x - expected_screen.x).abs() < 1e-3);
+            assert!((tf.translation.y - expected_screen.y).abs() < 1e-3);
+            assert!(asm.parts.len() >= 20);
+            let blade_up_hash = cache_key.assembly_hash;
+
+            // Verify toggling BladeDown produces a distinct assembly hash
+            let (down_base, down_asm) = pd_dozer::build_dozer_iso_assembly(BladeState::BladeDown);
+            let down_key = pd_world::IsoMeshCacheKey::compute(pose, &down_base, Some(&down_asm));
+            assert_ne!(blade_up_hash, down_key.assembly_hash);
+        }
+
+        // Verify buildings, props, and AI agents all have 2.5D IsoExtrudedBox + Mesh2d
+        let extruded_mesh_count = app
+            .world_mut()
+            .query_filtered::<Entity, (With<IsoExtrudedBox>, With<Mesh2d>)>()
+            .iter(app.world())
+            .count();
+        assert!(extruded_mesh_count >= 25);
     }
 }
+
 

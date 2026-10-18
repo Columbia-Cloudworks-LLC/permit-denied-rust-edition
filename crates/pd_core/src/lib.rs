@@ -406,6 +406,281 @@ pub fn sanitize_vec3(vec: Vec3, fallback: Vec3) -> Vec3 {
     }
 }
 
+/// 2.5D Cartesian world-space simulation pose decoupled from screen-space isometric `Transform`.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct WorldPose {
+    pub pos: Vec2,
+    pub elev_z: f32,
+    pub heading_rad: f32,
+    pub pitch_rad: f32,
+    pub roll_rad: f32,
+}
+
+impl WorldPose {
+    #[must_use]
+    pub fn new(pos: Vec2, elev_z: f32, heading_rad: f32) -> Self {
+        Self {
+            pos: sanitize_vec2(pos, Vec2::ZERO),
+            elev_z: sanitize_f32(elev_z, 0.0),
+            heading_rad: sanitize_f32(heading_rad, 0.0),
+            pitch_rad: 0.0,
+            roll_rad: 0.0,
+        }
+    }
+
+    #[must_use]
+    pub fn from_xy(x: f32, y: f32) -> Self {
+        Self::new(Vec2::new(x, y), 0.0, 0.0)
+    }
+
+    #[must_use]
+    pub fn with_elevation(mut self, elev_z: f32) -> Self {
+        self.elev_z = sanitize_f32(elev_z, 0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_heading(mut self, heading_rad: f32) -> Self {
+        self.heading_rad = sanitize_f32(heading_rad, 0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pitch_roll(mut self, pitch_rad: f32, roll_rad: f32) -> Self {
+        self.pitch_rad = sanitize_f32(pitch_rad, 0.0);
+        self.roll_rad = sanitize_f32(roll_rad, 0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn sanitized(self) -> Self {
+        Self {
+            pos: sanitize_vec2(self.pos, Vec2::ZERO),
+            elev_z: sanitize_f32(self.elev_z, 0.0),
+            heading_rad: sanitize_f32(self.heading_rad, 0.0),
+            pitch_rad: sanitize_f32(self.pitch_rad, 0.0),
+            roll_rad: sanitize_f32(self.roll_rad, 0.0),
+        }
+    }
+}
+
+/// Optional deterministic depth layer bias added when computing `iso_depth_key` for an entity.
+/// Ground/background and particle overlay layers use large offsets, whereas mutually occluding
+/// 3D world objects share `ISO_BIAS_WORLD_OBJECTS` (`10.0`) with tiny tie-break offsets (`<= 6e-4`)
+/// so world-space isometric depth `-(ground_iso.y)` always governs occlusion.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct IsoLayerBias(pub f32);
+
+/// Base terrain backdrop layer bias (`-550.0`).
+pub const ISO_BIAS_GROUND_BACKDROP: f32 = -550.0;
+/// Base chunked isometric tilemap layer bias (`-480.0`).
+pub const ISO_BIAS_GROUND_TILES: f32 = -480.0;
+/// Dynamic ground decal / scar layer bias (`-420.0`).
+pub const ISO_BIAS_GROUND_DECALS: f32 = -420.0;
+/// Building interior floor slab layer bias (`-360.0`), above ground decals and below 3D world objects.
+pub const ISO_BIAS_INTERIOR_FLOOR: f32 = -360.0;
+/// Common base layer bias (`10.0`) shared by all mutually occluding 3D world objects.
+pub const ISO_BIAS_WORLD_OBJECTS: f32 = 10.0;
+/// Tie-break bias for structural debris chunks (`10.0001`).
+pub const ISO_BIAS_DEBRIS: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0001;
+/// Tie-break bias for interior furniture and exterior street props (`10.0002`).
+pub const ISO_BIAS_PROP: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0002;
+/// Tie-break bias for pedestrians (`10.0003`).
+pub const ISO_BIAS_PEDESTRIAN: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0003;
+/// Tie-break bias for traffic vehicles (`10.0004`).
+pub const ISO_BIAS_VEHICLE: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0004;
+/// Tie-break bias for modular buildings (`10.0005`).
+pub const ISO_BIAS_BUILDING: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0005;
+/// Tie-break bias for the player's armored bulldozer (`10.0006`).
+pub const ISO_BIAS_DOZER: f32 = ISO_BIAS_WORLD_OBJECTS + 0.0006;
+/// Airborne particle burst / weather overlay layer bias (`120.0`).
+pub const ISO_BIAS_PARTICLES: f32 = 120.0;
+
+/// Projects Cartesian 2D world coordinates `(world_xy)` and vertical elevation `elev_z` into
+/// 2:1 isometric screen coordinates (`+X` world -> down-right `(2:1)`, `+Y` world -> down-left `(2:1)`,
+/// `+Z` elevation -> straight up on screen).
+#[must_use]
+pub fn world_to_iso_screen(world_xy: Vec2, elev_z: f32) -> Vec2 {
+    let safe_xy = sanitize_vec2(world_xy, Vec2::ZERO);
+    let safe_z = sanitize_f32(elev_z, 0.0).clamp(-500.0, 2_000.0);
+    let screen_x = safe_xy.x - safe_xy.y;
+    let screen_y = -(safe_xy.x + safe_xy.y) * 0.5 + safe_z;
+    sanitize_vec2(Vec2::new(screen_x, screen_y), Vec2::ZERO)
+}
+
+/// Inverse of `world_to_iso_screen`: converts isometric screen coordinates `screen_xy` at elevation
+/// `elev_z` back into 2D Cartesian world coordinates.
+#[must_use]
+pub fn iso_screen_to_world(screen_xy: Vec2, elev_z: f32) -> Vec2 {
+    let safe_s = sanitize_vec2(screen_xy, Vec2::ZERO);
+    let safe_z = sanitize_f32(elev_z, 0.0).clamp(-500.0, 2_000.0);
+    let adj_y = -(safe_s.y - safe_z) * 2.0;
+    sanitize_vec2(
+        Vec2::new((adj_y + safe_s.x) * 0.5, (adj_y - safe_s.x) * 0.5),
+        Vec2::ZERO,
+    )
+}
+
+/// Computes a deterministic painter's Z depth key in `[-800.0, 800.0]` from Cartesian `world_xy`,
+/// vertical `elev_z`, and `layer_bias`. Positional isometric depth (`-ground_iso.y * 0.05`) spans
+/// `~50.0` units across the playable site so world position determines occlusion among objects
+/// sharing `ISO_BIAS_WORLD_OBJECTS`, while `layer_bias` separates ground/overlay layers and breaks
+/// exact ties.
+#[must_use]
+pub fn iso_depth_key(world_xy: Vec2, elev_z: f32, layer_bias: f32) -> f32 {
+    let safe_xy = sanitize_vec2(world_xy, Vec2::ZERO);
+    let safe_z = sanitize_f32(elev_z, 0.0).clamp(0.0, 500.0);
+    let bias = sanitize_f32(layer_bias, 0.0);
+    let ground_iso = world_to_iso_screen(safe_xy, 0.0);
+    let raw_z = bias - (ground_iso.y * 0.05) - (ground_iso.x * 0.00001) + (safe_z * 0.002);
+    sanitize_f32(raw_z, 0.0).clamp(-800.0, 800.0)
+}
+
+/// Offsets a 2D Cartesian world point by `along` (along `heading_rad`) and `across`
+/// (perpendicular right of `heading_rad`), matching `headingOffset` in `drawIso.ts`.
+#[must_use]
+pub fn heading_offset(origin: Vec2, heading_rad: f32, along: f32, across: f32) -> Vec2 {
+    let p = sanitize_vec2(origin, Vec2::ZERO);
+    let h = sanitize_f32(heading_rad, 0.0);
+    let a = sanitize_f32(along, 0.0);
+    let c = sanitize_f32(across, 0.0);
+    let (fy, fx) = h.sin_cos();
+    sanitize_vec2(Vec2::new(p.x + fx * a - fy * c, p.y + fy * a + fx * c), p)
+}
+
+/// Optional roof/wedge slope profile for a 2.5D extruded isometric box (`IsoExtrudedBox`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum RoofSlopeSpec {
+    /// Linearly slopes across the width (`+width/2` to `-width/2`), matching `slope = true` in `drawOrientedIsoBox`.
+    AcrossWidth { low_scale: f32, high_scale: f32 },
+    /// Linearly slopes along the length (`-length/2` to `+length/2`).
+    AlongLength { back_scale: f32, front_scale: f32 },
+    /// Pitched gable roof with a raised ridge along the centerline.
+    Gable { eave_scale: f32, ridge_scale: f32 },
+}
+
+/// 2.5D extruded isometric box specification (`drawOrientedIsoBox`) rendered with upper-west
+/// sun lighting on its visible side faces and top lid plus an optional ground drop-shadow.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct IsoExtrudedBox {
+    pub center: Vec2,
+    pub heading: f32,
+    pub pitch: f32,
+    pub roll: f32,
+    pub length: f32,
+    pub width: f32,
+    pub z0: f32,
+    pub height: f32,
+    pub base_color: Color,
+    pub alpha: f32,
+    pub roof_slope: Option<RoofSlopeSpec>,
+    pub cast_shadow: bool,
+}
+
+impl Default for IsoExtrudedBox {
+    fn default() -> Self {
+        Self {
+            center: Vec2::ZERO,
+            heading: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            length: 16.0,
+            width: 16.0,
+            z0: 0.0,
+            height: 12.0,
+            base_color: Color::srgb(0.72, 0.72, 0.74),
+            alpha: 1.0,
+            roof_slope: None,
+            cast_shadow: true,
+        }
+    }
+}
+
+impl IsoExtrudedBox {
+    #[must_use]
+    pub fn new(length: f32, width: f32, height: f32, base_color: Color) -> Self {
+        Self {
+            center: Vec2::ZERO,
+            heading: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+            length: sanitize_f32(length, 1.0).max(0.1),
+            width: sanitize_f32(width, 1.0).max(0.1),
+            z0: 0.0,
+            height: sanitize_f32(height, 1.0).max(0.05),
+            base_color,
+            alpha: 1.0,
+            roof_slope: None,
+            cast_shadow: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_offset(mut self, center: Vec2, z0: f32) -> Self {
+        self.center = sanitize_vec2(center, Vec2::ZERO);
+        self.z0 = sanitize_f32(z0, 0.0).max(0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_heading(mut self, heading: f32) -> Self {
+        self.heading = sanitize_f32(heading, 0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shadow(mut self, cast_shadow: bool) -> Self {
+        self.cast_shadow = cast_shadow;
+        self
+    }
+
+    #[must_use]
+    pub fn with_alpha(mut self, alpha: f32) -> Self {
+        self.alpha = sanitize_f32(alpha, 1.0).clamp(0.0, 1.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_pitch_roll(mut self, pitch: f32, roll: f32) -> Self {
+        self.pitch = sanitize_f32(pitch, 0.0);
+        self.roll = sanitize_f32(roll, 0.0);
+        self
+    }
+
+    #[must_use]
+    pub fn with_roof_slope(mut self, slope: RoofSlopeSpec) -> Self {
+        self.roof_slope = Some(slope);
+        self
+    }
+}
+
+/// Multi-box 2.5D isometric volume assembly attached to an entity (dozer, building, prop,
+/// vehicle, pedestrian, or debris cluster).
+#[derive(Component, Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IsoBoxAssembly {
+    pub parts: Vec<IsoExtrudedBox>,
+    pub alpha_multiplier: f32,
+}
+
+impl Default for IsoBoxAssembly {
+    fn default() -> Self {
+        Self {
+            parts: Vec::new(),
+            alpha_multiplier: 1.0,
+        }
+    }
+}
+
+impl IsoBoxAssembly {
+    #[must_use]
+    pub fn new(parts: Vec<IsoExtrudedBox>) -> Self {
+        Self {
+            parts,
+            alpha_multiplier: 1.0,
+        }
+    }
+}
+
 /// Resource tracking the 6-digit demolition cash counter and smooth odometer reel state.
 #[derive(Resource, Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CashLedger {
@@ -780,5 +1055,53 @@ mod tests {
 
         assert!(pool.active_count() <= MAX_CASH_POPUPS);
         assert_eq!(ledger.current_cash, 30_000);
+    }
+
+    #[test]
+    fn test_world_pose_and_isometric_projection_axes() {
+        // +X in world space moves diagonally down-right (2:1) on screen
+        let plus_x = world_to_iso_screen(Vec2::new(20.0, 0.0), 0.0);
+        assert!(plus_x.x > 0.0);
+        assert!(plus_x.y < 0.0);
+        assert!((plus_x.x.abs() - 2.0 * plus_x.y.abs()).abs() < 1e-4);
+
+        // +Y in world space moves diagonally down-left (2:1) on screen
+        let plus_y = world_to_iso_screen(Vec2::new(0.0, 20.0), 0.0);
+        assert!(plus_y.x < 0.0);
+        assert!(plus_y.y < 0.0);
+        assert!((plus_y.x.abs() - 2.0 * plus_y.y.abs()).abs() < 1e-4);
+
+        // Round-trip screen -> world
+        let orig = Vec2::new(42.5, -18.25);
+        let screen = world_to_iso_screen(orig, 12.0);
+        let recovered = iso_screen_to_world(screen, 12.0);
+        assert!((recovered - orig).length() < 1e-3);
+
+        // Non-finite inputs sanitize cleanly without panicking
+        let nan_pose = WorldPose {
+            pos: Vec2::new(f32::NAN, f32::INFINITY),
+            elev_z: f32::NAN,
+            heading_rad: f32::INFINITY,
+            pitch_rad: f32::NEG_INFINITY,
+            roll_rad: f32::NAN,
+        }
+        .sanitized();
+        assert!(nan_pose.pos.is_finite());
+        assert!(nan_pose.elev_z.is_finite());
+        assert!(nan_pose.heading_rad.is_finite());
+        assert!(nan_pose.pitch_rad.is_finite());
+        assert!(nan_pose.roll_rad.is_finite());
+        assert!(iso_depth_key(Vec2::splat(f32::NAN), f32::INFINITY, f32::NAN).is_finite());
+
+        // Cross-category occlusion: a building closer to the camera (higher x + y) must have a
+        // greater Z depth key than a dozer behind it, and vice versa when the dozer moves in front.
+        let building_pos = Vec2::new(0.0, 120.0);
+        let dozer_behind_pos = Vec2::new(0.0, 40.0);
+        let dozer_in_front_pos = Vec2::new(0.0, 180.0);
+        let building_z = iso_depth_key(building_pos, 0.0, ISO_BIAS_BUILDING);
+        let dozer_behind_z = iso_depth_key(dozer_behind_pos, 0.0, ISO_BIAS_DOZER);
+        let dozer_front_z = iso_depth_key(dozer_in_front_pos, 0.0, ISO_BIAS_DOZER);
+        assert!(building_z > dozer_behind_z);
+        assert!(dozer_front_z > building_z);
     }
 }

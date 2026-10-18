@@ -9,9 +9,11 @@ use bevy::prelude::*;
 use pd_core::{
     ActiveCollapseZones, AppState, AudioSfxKind, AudioTriggerEvent, CashPopupPool, CollapseZone,
     DebugTelemetry, DecalKind, DecalSpawnRequest, DemolitionCashEvent, EnvironmentConfig, GameMode,
-    PdSystemSet, SessionEpoch, SiteScoped, sanitize_dt, sanitize_f32, sanitize_vec2,
+    ISO_BIAS_PEDESTRIAN, ISO_BIAS_VEHICLE, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
+    PdSystemSet, SessionEpoch, SiteScoped, WorldPose, iso_depth_key, iso_screen_to_world,
+    sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
 };
-use pd_world::{RoadSplineGraph, SpatialHashGrid, compute_stable_iso_z};
+use pd_world::{RoadSplineGraph, SpatialHashGrid};
 use serde::{Deserialize, Serialize};
 
 /// Threat detection radius around the dozer and active building collapses.
@@ -63,6 +65,20 @@ impl Facing8Way {
             _ => Self::NorthWest,
         }
     }
+
+    #[must_use]
+    pub const fn to_heading_radians(self) -> f32 {
+        match self {
+            Self::East => 0.0,
+            Self::NorthEast => std::f32::consts::FRAC_PI_4,
+            Self::North => std::f32::consts::FRAC_PI_2,
+            Self::NorthWest => 3.0 * std::f32::consts::FRAC_PI_4,
+            Self::West => std::f32::consts::PI,
+            Self::SouthWest => -3.0 * std::f32::consts::FRAC_PI_4,
+            Self::South => -std::f32::consts::FRAC_PI_2,
+            Self::SouthEast => -std::f32::consts::FRAC_PI_4,
+        }
+    }
 }
 
 /// Ambient and reactive vehicle archetypes per Section 4 of the PRD.
@@ -98,6 +114,223 @@ impl VehicleArchetype {
             Self::SwatVan => Color::srgb(0.18, 0.20, 0.24),
         }
     }
+}
+
+/// Builds a 2.5D multi-box isometric assembly for a pedestrian (`Issue #10`).
+#[must_use]
+pub fn build_pedestrian_iso_assembly(
+    panicked: bool,
+    variant: u8,
+) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let legs = IsoExtrudedBox::new(4.2, 4.8, 5.2, Color::srgb(0.20, 0.24, 0.32))
+        .with_offset(Vec2::ZERO, 0.0)
+        .with_shadow(true);
+
+    let jacket_col = if panicked {
+        Color::srgb(0.96, 0.30, 0.18)
+    } else {
+        match variant % 4 {
+            0 => Color::srgb(0.24, 0.56, 0.78),
+            1 => Color::srgb(0.82, 0.66, 0.22),
+            2 => Color::srgb(0.32, 0.68, 0.42),
+            _ => Color::srgb(0.72, 0.34, 0.48),
+        }
+    };
+
+    let mut parts = Vec::with_capacity(4);
+    parts.push(
+        IsoExtrudedBox::new(4.8, 5.8, 6.2, jacket_col)
+            .with_offset(Vec2::ZERO, 5.0)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(3.8, 3.8, 3.8, Color::srgb(0.92, 0.76, 0.62))
+            .with_offset(Vec2::ZERO, 11.2)
+            .with_shadow(false),
+    );
+    // Raised arms when panicked
+    if panicked {
+        for side in [-1.0_f32, 1.0_f32] {
+            parts.push(
+                IsoExtrudedBox::new(2.0, 2.0, 5.5, jacket_col)
+                    .with_offset(Vec2::new(0.5, side * 3.8), 9.5)
+                    .with_shadow(false),
+            );
+        }
+    } else if variant.is_multiple_of(2) {
+        // Hard-hat on site inspectors/workers
+        parts.push(
+            IsoExtrudedBox::new(4.4, 4.4, 1.5, Color::srgb(0.95, 0.80, 0.16))
+                .with_offset(Vec2::ZERO, 14.8)
+                .with_shadow(false),
+        );
+    }
+
+    (
+        legs,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
+}
+
+/// Builds a 2.5D multi-box isometric assembly for ambient and emergency traffic vehicles,
+/// including wheels, lower hull, bumpers, cabin glass, roof, and lightbars (`Issue #10`,
+/// matching `vehicles.ts`).
+#[must_use]
+pub fn build_vehicle_iso_assembly(
+    archetype: VehicleArchetype,
+    wrecked: bool,
+) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let tint = |c: Color| -> Color {
+        if wrecked {
+            let s = c.to_srgba();
+            Color::srgba(s.red * 0.45, s.green * 0.45, s.blue * 0.48, s.alpha)
+        } else {
+            c
+        }
+    };
+
+    let (length, width, hull_h) = match archetype {
+        VehicleArchetype::CityBus => (44.0_f32, 18.0_f32, 11.5_f32),
+        VehicleArchetype::DeliveryVan | VehicleArchetype::SwatVan => (36.0_f32, 17.0_f32, 9.5_f32),
+        VehicleArchetype::PickupTruck | VehicleArchetype::CountyInspectorTruck => {
+            (34.0_f32, 16.5_f32, 6.8_f32)
+        }
+        VehicleArchetype::Sedan | VehicleArchetype::PoliceCruiser => (31.0_f32, 15.5_f32, 6.2_f32),
+    };
+
+    let base_hull = IsoExtrudedBox::new(length, width, hull_h, tint(archetype.base_color()))
+        .with_offset(Vec2::ZERO, 2.2)
+        .with_shadow(true);
+
+    let mut parts = Vec::with_capacity(14);
+
+    // 1. Four tires
+    let wheel_x = length * 0.31;
+    let wheel_y = width * 0.50;
+    for sx in [-1.0_f32, 1.0_f32] {
+        for sy in [-1.0_f32, 1.0_f32] {
+            parts.push(
+                IsoExtrudedBox::new(6.2, 2.6, 5.0, Color::srgb(0.14, 0.14, 0.16))
+                    .with_offset(Vec2::new(sx * wheel_x, sy * wheel_y), 0.0)
+                    .with_shadow(false),
+            );
+        }
+    }
+
+    // 2. Front and rear bumpers + headlights
+    parts.push(
+        IsoExtrudedBox::new(2.4, width * 0.94, 2.6, tint(Color::srgb(0.24, 0.25, 0.28)))
+            .with_offset(Vec2::new(length * 0.5, 0.0), 2.0)
+            .with_shadow(false),
+    );
+    parts.push(
+        IsoExtrudedBox::new(2.2, width * 0.94, 2.6, tint(Color::srgb(0.24, 0.25, 0.28)))
+            .with_offset(Vec2::new(-length * 0.5, 0.0), 2.0)
+            .with_shadow(false),
+    );
+
+    // 3. Cabin greenhouse & roof by archetype
+    let glass_col = tint(Color::srgb(0.24, 0.36, 0.44));
+    match archetype {
+        VehicleArchetype::Sedan | VehicleArchetype::PoliceCruiser => {
+            parts.push(
+                IsoExtrudedBox::new(length * 0.52, width * 0.86, 5.4, glass_col)
+                    .with_offset(Vec2::new(-1.5, 0.0), 2.2 + hull_h)
+                    .with_shadow(false),
+            );
+            let roof_col = if archetype == VehicleArchetype::PoliceCruiser {
+                tint(Color::srgb(0.92, 0.94, 0.96))
+            } else {
+                tint(archetype.base_color())
+            };
+            parts.push(
+                IsoExtrudedBox::new(length * 0.44, width * 0.82, 1.4, roof_col)
+                    .with_offset(Vec2::new(-1.5, 0.0), 7.6 + hull_h)
+                    .with_shadow(false),
+            );
+            if archetype == VehicleArchetype::PoliceCruiser {
+                // Red & blue emergency lightbar
+                parts.push(
+                    IsoExtrudedBox::new(3.2, 5.0, 1.8, tint(Color::srgb(0.95, 0.18, 0.18)))
+                        .with_offset(Vec2::new(-1.0, -2.6), 9.0 + hull_h)
+                        .with_shadow(false),
+                );
+                parts.push(
+                    IsoExtrudedBox::new(3.2, 5.0, 1.8, tint(Color::srgb(0.18, 0.48, 0.98)))
+                        .with_offset(Vec2::new(-1.0, 2.6), 9.0 + hull_h)
+                        .with_shadow(false),
+                );
+            }
+        }
+        VehicleArchetype::PickupTruck | VehicleArchetype::CountyInspectorTruck => {
+            // Forward cab
+            parts.push(
+                IsoExtrudedBox::new(length * 0.38, width * 0.88, 6.0, glass_col)
+                    .with_offset(Vec2::new(3.5, 0.0), 2.2 + hull_h)
+                    .with_shadow(false),
+            );
+            parts.push(
+                IsoExtrudedBox::new(
+                    length * 0.34,
+                    width * 0.84,
+                    1.5,
+                    tint(archetype.base_color()),
+                )
+                .with_offset(Vec2::new(3.5, 0.0), 8.2 + hull_h)
+                .with_shadow(false),
+            );
+            // Open rear bed liner
+            parts.push(
+                IsoExtrudedBox::new(
+                    length * 0.42,
+                    width * 0.82,
+                    2.0,
+                    tint(Color::srgb(0.22, 0.22, 0.25)),
+                )
+                .with_offset(Vec2::new(-length * 0.24, 0.0), 2.2 + hull_h)
+                .with_shadow(false),
+            );
+            if archetype == VehicleArchetype::CountyInspectorTruck {
+                // Amber municipal beacon bar
+                parts.push(
+                    IsoExtrudedBox::new(3.2, 8.5, 2.0, tint(Color::srgb(0.98, 0.72, 0.12)))
+                        .with_offset(Vec2::new(3.5, 0.0), 9.7 + hull_h)
+                        .with_shadow(false),
+                );
+            }
+        }
+        VehicleArchetype::DeliveryVan | VehicleArchetype::SwatVan | VehicleArchetype::CityBus => {
+            parts.push(
+                IsoExtrudedBox::new(length * 0.88, width * 0.92, 6.5, tint(archetype.base_color()))
+                    .with_offset(Vec2::new(-1.0, 0.0), 2.2 + hull_h)
+                    .with_shadow(false),
+            );
+            // Windshield visor
+            parts.push(
+                IsoExtrudedBox::new(4.5, width * 0.86, 4.8, glass_col)
+                    .with_offset(Vec2::new(length * 0.38, 0.0), 3.2 + hull_h)
+                    .with_shadow(false),
+            );
+            if archetype == VehicleArchetype::SwatVan {
+                parts.push(
+                    IsoExtrudedBox::new(3.5, 9.0, 2.0, tint(Color::srgb(0.92, 0.18, 0.18)))
+                        .with_offset(Vec2::new(length * 0.26, 0.0), 8.8 + hull_h)
+                        .with_shadow(false),
+                );
+            }
+        }
+    }
+
+    (
+        base_hull,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
 }
 
 /// Marker component for vehicles currently following the road lane spline cleanly.
@@ -263,8 +496,9 @@ pub fn update_crowd_and_traffic_spatial_grid(
     }
 }
 
-/// System wrapper invoking `update_crowd_and_traffic_spatial_grid` and applying agent velocities,
-/// road spline progression, oil slick decals, and spline-to-physics component transitions.
+/// System wrapper evaluating spatial grid threats in Cartesian `WorldPose` space and applying
+/// agent velocities, road spline progression, oil slick decals, and spline-to-physics transitions.
+#[allow(clippy::type_complexity)]
 pub fn fixed_crowd_and_traffic_ai_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -276,58 +510,171 @@ pub fn fixed_crowd_and_traffic_ai_system(
     mut cash_events: EventWriter<DemolitionCashEvent>,
     mut decal_events: EventWriter<DecalSpawnRequest>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
-    mut agent_queries: ParamSet<(
-        Query<(Entity, &mut AgentState, &Transform)>,
-        Query<(
-            Entity,
-            &mut AgentState,
-            &mut Transform,
-            Option<&mut Sprite>,
-            Option<&SplineFollower>,
-            Option<&mut LinearVelocity>,
-        )>,
+    mut nearby_candidates: Local<Vec<(Entity, Vec2)>>,
+    mut neighbor_scratch: Local<Vec<(Entity, Vec2)>>,
+    mut agents: Query<(
+        Entity,
+        &mut AgentState,
+        Option<&mut WorldPose>,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
+        &mut Transform,
+        Option<&mut IsoExtrudedBox>,
+        Option<&mut IsoBoxAssembly>,
+        Option<&SplineFollower>,
     )>,
 ) {
     let Ok(dt) = sanitize_dt(time.delta_secs()) else {
         return;
     };
 
-    let dozer_transform = Transform::from_translation(popup_pool.fallback_dozer_pos);
-    {
-        let mut p0 = agent_queries.p0();
-        update_crowd_and_traffic_spatial_grid(
-            &dozer_transform,
-            &collapse_zones.zones,
-            &mut spatial_grid,
-            &mut p0,
-        );
+    // Convert fallback_dozer_pos (stored in isometric screen space for HUD popups) back to Cartesian world XY
+    let dozer_pos = sanitize_vec2(
+        iso_screen_to_world(popup_pool.fallback_dozer_pos.truncate(), 0.0),
+        Vec2::ZERO,
+    );
+
+    spatial_grid.clear();
+    for (entity, _, world_pose, _, _, transform, _, _, _) in agents.iter() {
+        let pos = world_pose
+            .map_or_else(|| transform.translation.truncate(), |p| p.pos);
+        spatial_grid.insert(entity, sanitize_vec2(pos, Vec2::ZERO));
+    }
+
+    nearby_candidates.clear();
+    neighbor_scratch.clear();
+
+    spatial_grid.query_radius(dozer_pos, THREAT_RADIUS, &mut nearby_candidates);
+    for zone in &collapse_zones.zones {
+        let zone_center = sanitize_vec2(zone.center, Vec2::ZERO);
+        let zone_radius = sanitize_f32(zone.radius, THREAT_RADIUS).max(THREAT_RADIUS);
+        spatial_grid.query_radius(zone_center, zone_radius, &mut nearby_candidates);
+    }
+
+    nearby_candidates.sort_by_key(|(e, _)| e.index());
+    nearby_candidates.dedup_by_key(|(e, _)| *e);
+
+    for idx in 0..nearby_candidates.len() {
+        let Some(&(entity, agent_pos)) = nearby_candidates.get(idx) else {
+            continue;
+        };
+        let mut closest_threat = dozer_pos;
+        let mut closest_dist_sq = agent_pos.distance_squared(dozer_pos);
+        let mut struck_by_collapse = false;
+
+        for zone in &collapse_zones.zones {
+            let zc = sanitize_vec2(zone.center, Vec2::ZERO);
+            let d_sq = agent_pos.distance_squared(zc);
+            if d_sq < closest_dist_sq {
+                closest_dist_sq = d_sq;
+                closest_threat = zc;
+            }
+            let strike_r = sanitize_f32(zone.radius, 80.0) * 0.65;
+            if d_sq <= strike_r * strike_r {
+                struck_by_collapse = true;
+            }
+        }
+
+        neighbor_scratch.clear();
+        spatial_grid.query_radius(agent_pos, 28.0, &mut neighbor_scratch);
+        let mut separation = Vec2::ZERO;
+        for &(other_entity, other_pos) in neighbor_scratch.iter().take(MAX_NEIGHBOR_CHECKS) {
+            if other_entity != entity {
+                let away = safe_flee_direction(agent_pos, other_pos, entity);
+                separation += away * 0.25;
+            }
+        }
+
+        let escape_dir =
+            (safe_flee_direction(agent_pos, closest_threat, entity) + separation).normalize_or_zero();
+        let final_dir = if escape_dir.length_squared() < 1e-4 {
+            deterministic_escape_vector(entity)
+        } else {
+            escape_dir
+        };
+
+        if let Ok((_, mut state, _, _, _, _, base_box, assembly, _)) = agents.get_mut(entity) {
+            match *state {
+                AgentState::PedestrianStroll { .. } | AgentState::PedestrianPanic { .. } => {
+                    let was_stroll = matches!(*state, AgentState::PedestrianStroll { .. });
+                    let vel = sanitize_vec2(
+                        final_dir * PEDESTRIAN_PANIC_SPEED,
+                        deterministic_escape_vector(entity) * PEDESTRIAN_PANIC_SPEED,
+                    );
+                    *state = AgentState::PedestrianPanic {
+                        escape_velocity: vel,
+                        facing: Facing8Way::from_velocity(vel),
+                    };
+                    if was_stroll
+                        && let (Some(mut b_box), Some(mut asm)) = (base_box, assembly)
+                    {
+                        let (new_b, new_a) =
+                            build_pedestrian_iso_assembly(true, (entity.index() % 4) as u8);
+                        *b_box = new_b;
+                        *asm = new_a;
+                    }
+                }
+                AgentState::TrafficSpline { archetype, .. } => {
+                    let struck_by_dozer =
+                        closest_dist_sq <= VEHICLE_IMPACT_RADIUS * VEHICLE_IMPACT_RADIUS;
+                    if struck_by_dozer || struck_by_collapse {
+                        let knockback = sanitize_vec2(
+                            final_dir * MAX_VEHICLE_KNOCKBACK_SPEED,
+                            Vec2::new(MAX_VEHICLE_KNOCKBACK_SPEED, 0.0),
+                        );
+                        *state = AgentState::TrafficDynamicPhysics {
+                            archetype,
+                            knockback_velocity: knockback,
+                        };
+                    }
+                }
+                AgentState::TrafficDynamicPhysics { .. } => {}
+            }
+        }
     }
 
     let mut panicked_count: usize = 0;
 
-    // Apply locomotion and spline-to-physics transitions.
-    for (entity, mut state, mut transform, sprite, spline_follower, lin_vel) in
-        &mut agent_queries.p1()
+    // Apply locomotion and spline-to-physics transitions in Cartesian WorldPose space.
+    for (
+        entity,
+        mut state,
+        mut world_pose,
+        mut phys_pos,
+        mut phys_rot,
+        mut transform,
+        base_box,
+        assembly,
+        spline_follower,
+    ) in &mut agents
     {
         match *state {
-            AgentState::PedestrianStroll { velocity, .. } => {
+            AgentState::PedestrianStroll { velocity, facing } => {
                 let v = sanitize_vec2(velocity, Vec2::ZERO);
-                transform.translation.x =
-                    sanitize_f32(transform.translation.x + v.x * dt, transform.translation.x);
-                transform.translation.y =
-                    sanitize_f32(transform.translation.y + v.y * dt, transform.translation.y);
+                if let Some(pose) = world_pose.as_deref_mut() {
+                    pose.pos = sanitize_vec2(pose.pos + v * dt, pose.pos);
+                    pose.heading_rad = facing.to_heading_radians();
+                } else {
+                    transform.translation.x =
+                        sanitize_f32(transform.translation.x + v.x * dt, transform.translation.x);
+                    transform.translation.y =
+                        sanitize_f32(transform.translation.y + v.y * dt, transform.translation.y);
+                }
             }
             AgentState::PedestrianPanic {
-                escape_velocity, ..
+                escape_velocity,
+                facing,
             } => {
                 panicked_count = panicked_count.saturating_add(1);
                 let v = sanitize_vec2(escape_velocity, Vec2::ZERO);
-                transform.translation.x =
-                    sanitize_f32(transform.translation.x + v.x * dt, transform.translation.x);
-                transform.translation.y =
-                    sanitize_f32(transform.translation.y + v.y * dt, transform.translation.y);
-                if let Some(mut sp) = sprite {
-                    sp.color = Color::srgb(0.98, 0.34, 0.22);
+                if let Some(pose) = world_pose.as_deref_mut() {
+                    pose.pos = sanitize_vec2(pose.pos + v * dt, pose.pos);
+                    pose.heading_rad = facing.to_heading_radians();
+                } else {
+                    transform.translation.x =
+                        sanitize_f32(transform.translation.x + v.x * dt, transform.translation.x);
+                    transform.translation.y =
+                        sanitize_f32(transform.translation.y + v.y * dt, transform.translation.y);
                 }
             }
             AgentState::TrafficSpline {
@@ -341,38 +688,49 @@ pub fn fixed_crowd_and_traffic_ai_system(
                         *halted_by_rubble = true;
                     } else {
                         *halted_by_rubble = false;
-                        let current_xy = transform.translation.truncate();
+                        let current_xy = world_pose
+                            .as_deref()
+                            .map_or_else(|| transform.translation.truncate(), |p| p.pos);
                         let to_target = node.position - current_xy;
                         if to_target.length_squared() < 225.0 {
                             if let Some(next_idx) = node.next_node {
                                 *target_node = next_idx;
                             }
                         } else {
-                            let step =
-                                to_target.normalize_or_zero() * sanitize_f32(speed, 60.0) * dt;
-                            transform.translation.x = sanitize_f32(
-                                transform.translation.x + step.x,
-                                transform.translation.x,
-                            );
-                            transform.translation.y = sanitize_f32(
-                                transform.translation.y + step.y,
-                                transform.translation.y,
-                            );
+                            let dir = to_target.normalize_or_zero();
+                            let step = dir * sanitize_f32(speed, 60.0) * dt;
+                            if let Some(pose) = world_pose.as_deref_mut() {
+                                pose.pos = sanitize_vec2(pose.pos + step, pose.pos);
+                                pose.heading_rad = sanitize_f32(dir.y.atan2(dir.x), pose.heading_rad);
+                            } else {
+                                transform.translation.x = sanitize_f32(
+                                    transform.translation.x + step.x,
+                                    transform.translation.x,
+                                );
+                                transform.translation.y = sanitize_f32(
+                                    transform.translation.y + step.y,
+                                    transform.translation.y,
+                                );
+                            }
                         }
                     }
                 }
             }
             AgentState::TrafficDynamicPhysics {
                 archetype,
-                knockback_velocity,
+                ref mut knockback_velocity,
             } => {
-                let clamped_vel = sanitize_vec2(knockback_velocity, Vec2::ZERO)
+                let clamped_vel = sanitize_vec2(*knockback_velocity, Vec2::ZERO)
                     .clamp_length_max(MAX_VEHICLE_KNOCKBACK_SPEED);
                 if spline_follower.is_some() {
-                    let pos_xy = transform.translation.truncate();
+                    let pos_xy = world_pose
+                        .as_deref()
+                        .map_or_else(|| transform.translation.truncate(), |p| p.pos);
+                    let heading = world_pose.as_deref().map_or(0.0, |p| p.heading_rad);
+                    let screen_xy = world_to_iso_screen(pos_xy, 8.0);
                     cash_events.send(DemolitionCashEvent {
                         amount: archetype.cash_value(),
-                        world_pos: pos_xy.extend(0.0),
+                        world_pos: screen_xy.extend(0.0),
                     });
                     decal_events.send(DecalSpawnRequest {
                         kind: DecalKind::OilSlick,
@@ -383,20 +741,43 @@ pub fn fixed_crowd_and_traffic_ai_system(
                     audio_events.send(AudioTriggerEvent {
                         kind: AudioSfxKind::StructuralCrunch,
                     });
-                    if let Some(mut sp) = sprite {
-                        sp.color = Color::srgb(0.32, 0.33, 0.36);
+                    if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
+                        let (new_b, new_a) = build_vehicle_iso_assembly(archetype, true);
+                        *b_box = new_b;
+                        *asm = new_a;
                     }
                     if let Some(mut e_cmds) = commands.get_entity(entity) {
                         e_cmds.remove::<SplineFollower>().insert((
                             DynamicPhysicsVehicle,
+                            Position(pos_xy),
+                            Rotation::radians(heading),
                             RigidBody::Dynamic,
                             Collider::rectangle(34.0, 18.0),
-                            LinearVelocity(clamped_vel),
-                            AngularVelocity(1.8),
+                            LinearVelocity::default(),
+                            AngularVelocity::default(),
                         ));
                     }
-                } else if let Some(mut lv) = lin_vel {
-                    lv.0 = sanitize_vec2(lv.0 * 0.96, Vec2::ZERO);
+                } else {
+                    if let Some(pose) = world_pose.as_deref_mut() {
+                        if let Some(pos) = phys_pos.as_deref() {
+                            pose.pos = sanitize_vec2(pos.0, pose.pos);
+                        }
+                        pose.pos = sanitize_vec2(pose.pos + clamped_vel * dt, pose.pos);
+                        if clamped_vel.length_squared() > 9.0 {
+                            pose.heading_rad =
+                                sanitize_f32(pose.heading_rad + 1.8 * dt, pose.heading_rad);
+                            pose.roll_rad = 0.14;
+                        } else {
+                            pose.roll_rad = 0.05;
+                        }
+                        if let Some(pos) = phys_pos.as_deref_mut() {
+                            pos.0 = pose.pos;
+                        }
+                        if let Some(rot) = phys_rot.as_deref_mut() {
+                            *rot = Rotation::radians(pose.heading_rad);
+                        }
+                    }
+                    *knockback_velocity = sanitize_vec2(clamped_vel * 0.92, Vec2::ZERO);
                 }
             }
         }
@@ -405,7 +786,8 @@ pub fn fixed_crowd_and_traffic_ai_system(
     telemetry.panicked_pedestrians = panicked_count;
 }
 
-/// Spawns initial ambient pedestrians and road vehicles for the current `SessionEpoch`.
+/// Spawns initial ambient pedestrians and road vehicles in Cartesian `WorldPose` space with
+/// 2.5D multi-box assemblies (`Issues #7 and #10`).
 pub fn ensure_site_crowd_and_traffic_spawned_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
@@ -422,21 +804,28 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
         let angle = f32::from(i) * (std::f32::consts::TAU / 10.0);
         let pos = Vec2::new(angle.cos() * 190.0, angle.sin() * 140.0);
         let stroll_vel = Vec2::new(-angle.sin() * 18.0, angle.cos() * 18.0);
+        let facing = Facing8Way::from_velocity(stroll_vel);
+        let heading = facing.to_heading_radians();
+        let iso_xy = world_to_iso_screen(pos, 0.0);
+        let iso_z = iso_depth_key(pos, 4.0, ISO_BIAS_PEDESTRIAN);
+        let (ped_base, ped_asm) = build_pedestrian_iso_assembly(false, i);
 
         commands.spawn((
             Name::new(format!("Pedestrian #{i}")),
             SiteScoped { epoch: *epoch },
             AgentState::PedestrianStroll {
                 velocity: stroll_vel,
-                facing: Facing8Way::from_velocity(stroll_vel),
+                facing,
             },
-            Sprite {
-                color: Color::srgb(0.92, 0.78, 0.32),
-                custom_size: Some(Vec2::new(10.0, 16.0)),
-                ..Default::default()
-            },
-            Transform::from_xyz(pos.x, pos.y, compute_stable_iso_z(pos.x, pos.y, 4.0, 8.0)),
+            WorldPose::new(pos, 0.0, heading),
+            IsoLayerBias(ISO_BIAS_PEDESTRIAN),
+            ped_base,
+            ped_asm,
+            Transform::from_xyz(iso_xy.x, iso_xy.y, iso_z),
             GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            ViewVisibility::default(),
         ));
     }
 
@@ -469,6 +858,15 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
             .get(idx)
             .and_then(|n| n.next_node)
             .unwrap_or(0);
+        let target_xy = road_graph
+            .nodes
+            .get(next_idx)
+            .map_or(Vec2::ZERO, |n| n.position);
+        let dir = (target_xy - spawn_xy).normalize_or_zero();
+        let heading = sanitize_f32(dir.y.atan2(dir.x), 0.0);
+        let iso_xy = world_to_iso_screen(spawn_xy, 0.0);
+        let iso_z = iso_depth_key(spawn_xy, 8.0, ISO_BIAS_VEHICLE);
+        let (veh_base, veh_asm) = build_vehicle_iso_assembly(archetype, false);
 
         commands.spawn((
             Name::new(format!("Traffic Vehicle #{idx} ({archetype:?})")),
@@ -483,17 +881,15 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
                 speed: 65.0,
                 halted_by_rubble: false,
             },
-            Sprite {
-                color: archetype.base_color(),
-                custom_size: Some(Vec2::new(34.0, 20.0)),
-                ..Default::default()
-            },
-            Transform::from_xyz(
-                spawn_xy.x,
-                spawn_xy.y,
-                compute_stable_iso_z(spawn_xy.x, spawn_xy.y, 8.0, 9.0),
-            ),
+            WorldPose::new(spawn_xy, 0.0, heading),
+            IsoLayerBias(ISO_BIAS_VEHICLE),
+            veh_base,
+            veh_asm,
+            Transform::from_xyz(iso_xy.x, iso_xy.y, iso_z),
             GlobalTransform::default(),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            ViewVisibility::default(),
         ));
     }
 }
@@ -507,8 +903,10 @@ impl Plugin for PdAiPlugin {
             Update,
             ensure_site_crowd_and_traffic_spawned_system
                 .run_if(in_state(AppState::Playing))
-                .after(PdSystemSet::WorldTilemapSync)
-                .before(PdSystemSet::HudInterpolation),
+                .in_set(PdSystemSet::WorldTilemapSync)
+                .after(pd_world::sync_world_on_site_restart_system)
+                .before(pd_world::ensure_site_ground_spawned_system)
+                .before(pd_world::project_world_poses_to_isometric_transform_system),
         )
         .add_systems(
             FixedUpdate,
@@ -523,6 +921,9 @@ impl Plugin for PdAiPlugin {
 mod tests {
     use super::*;
     use bevy::ecs::system::SystemState;
+    use bevy::state::app::StatesPlugin;
+    use pd_core::{CampaignLevel, PdCorePlugin, SiteRestartRequested};
+    use pd_world::PdWorldPlugin;
 
     #[test]
     fn test_zero_distance_threat_produces_finite_escape_vector() {
@@ -580,5 +981,54 @@ mod tests {
             );
             assert!(is_dynamic);
         }
+    }
+
+    #[test]
+    fn test_traffic_spawns_from_rebuilt_road_spline_graph_on_restart() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, StatesPlugin))
+            .add_plugins((PdCorePlugin, PdWorldPlugin, PdAiPlugin));
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        app.update();
+        app.update();
+
+        // Now change CampaignLevel to CityDowntown6 (half_span = 260 + 6 * 32 = 452.0) and trigger restart
+        app.world_mut().resource_mut::<EnvironmentConfig>().level = CampaignLevel::CityDowntown6;
+        app.world_mut().send_event(SiteRestartRequested {
+            preserve_layout: false,
+        });
+        app.update();
+
+        let expected_nodes: Vec<Vec2> = app
+            .world()
+            .resource::<RoadSplineGraph>()
+            .nodes
+            .iter()
+            .map(|n| n.position)
+            .collect();
+        assert_eq!(expected_nodes.len(), 8);
+        assert!((expected_nodes.first().map_or(0.0, |v| v.x) - (-452.0)).abs() < 1e-3);
+
+        // Verify all 5 traffic vehicles spawned in the SAME frame as the site restart use the rebuilt
+        // CityDowntown6 RoadSplineGraph node positions (not the previous County1 250.0 extent!).
+        let mut vehicle_poses: Vec<Vec2> = app
+            .world_mut()
+            .query_filtered::<&WorldPose, With<SplineFollower>>()
+            .iter(app.world())
+            .map(|p| p.pos)
+            .collect();
+        assert_eq!(vehicle_poses.len(), 5);
+        for expected in expected_nodes.iter().take(5) {
+            assert!(
+                vehicle_poses
+                    .iter()
+                    .any(|p| p.distance_squared(*expected) < 1e-3),
+                "Expected vehicle at rebuilt spline node {expected:?}, got {vehicle_poses:?}"
+            );
+        }
+        vehicle_poses.clear();
     }
 }

@@ -10,14 +10,13 @@ use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
 use pd_core::{
     ActiveCollapseZones, AppState, AudioSfxKind, AudioTriggerEvent, CampaignLevel, CollapseZone,
-    DebugTelemetry, DemolitionCashEvent, EnvironmentConfig,
-    ParticleBurstEvent, ParticleBurstKind, PdSystemSet, SessionEpoch, SiteRestartRequested,
-    SiteScoped, sanitize_dt, sanitize_f32, sanitize_vec2,
+    DebugTelemetry, DemolitionCashEvent, EnvironmentConfig, ISO_BIAS_BUILDING, ISO_BIAS_DEBRIS,
+    ISO_BIAS_INTERIOR_FLOOR, ISO_BIAS_PROP, IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias,
+    ParticleBurstEvent, ParticleBurstKind, PdSystemSet, RoofSlopeSpec, SessionEpoch,
+    SiteRestartRequested, SiteScoped, WorldPose, iso_depth_key, sanitize_dt, sanitize_f32,
+    sanitize_vec2, world_to_iso_screen,
 };
-use pd_world::{
-    CutawayFootprint, ProceduralWorldAtlas, RoadSplineGraph, atlas_indices, compute_stable_iso_z,
-    grid_to_iso_world, validate_atlas_index, MAX_PROCEDURAL_ATLAS_INDEX,
-};
+use pd_world::{CutawayFootprint, ProceduralWorldAtlas, RoadSplineGraph};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -383,6 +382,8 @@ pub struct DebrisChunk {
     pub active_timer_secs: f32,
     pub simulated_z_height: f32,
     pub vertical_z_velocity: f32,
+    pub horizontal_velocity: Vec2,
+    pub spin_rate: f32,
 }
 
 /// Fixed-capacity ring-buffer pool governing active physics debris (`<= 500` bodies).
@@ -442,6 +443,7 @@ impl DebrisPoolRegistry {
 pub struct ModularBuilding {
     pub archetype_name: String,
     pub stories: u8,
+    pub palette_index: usize,
 }
 
 /// Helper that generates a multi-story modular building graph for the given campaign level.
@@ -520,7 +522,291 @@ pub fn build_procedural_building_graph(stories: u8, footprint_half: i32) -> Vec<
     nodes
 }
 
-/// Spawns a single dynamic debris entity and registers it in the 500-cap ring buffer.
+/// Builds a 2.5D multi-box isometric assembly for a modular building from its live
+/// `StructuralNode` graph (`Issue #10`). Damaged/destroyed nodes are omitted or rendered
+/// as cracked masonry so real-time structural breaches are visually carved out in 2.5D.
+#[must_use]
+pub fn build_building_iso_assembly(
+    nodes: &HashMap<NodeIndex, StructuralNode>,
+    stories: u8,
+    palette_index: usize,
+) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let (wall_col, pillar_col, roof_col, trim_col) = match palette_index % 3 {
+        0 => (
+            Color::srgb(0.72, 0.36, 0.28),
+            Color::srgb(0.54, 0.28, 0.22),
+            Color::srgb(0.34, 0.36, 0.40),
+            Color::srgb(0.84, 0.80, 0.72),
+        ),
+        1 => (
+            Color::srgb(0.76, 0.68, 0.54),
+            Color::srgb(0.58, 0.50, 0.40),
+            Color::srgb(0.40, 0.34, 0.30),
+            Color::srgb(0.88, 0.84, 0.76),
+        ),
+        _ => (
+            Color::srgb(0.52, 0.58, 0.66),
+            Color::srgb(0.36, 0.42, 0.48),
+            Color::srgb(0.28, 0.32, 0.36),
+            Color::srgb(0.74, 0.78, 0.82),
+        ),
+    };
+
+    let base_slab = IsoExtrudedBox::new(112.0, 82.0, 3.0, Color::srgb(0.40, 0.38, 0.36))
+        .with_offset(Vec2::ZERO, 0.0)
+        .with_shadow(true);
+
+    let mut sorted_ids: Vec<NodeIndex> = nodes.keys().copied().collect();
+    sorted_ids.sort_unstable();
+
+    let mut parts = Vec::with_capacity(sorted_ids.len() * 2 + 4);
+    let story_h = 16.0_f32;
+
+    for id in sorted_ids {
+        let Some(node) = nodes.get(&id) else {
+            continue;
+        };
+        if !node.intact {
+            continue;
+        }
+
+        let local_xy = Vec2::new(node.grid_x as f32 * 21.0, node.grid_y as f32 * 15.0);
+        let z0 = 3.0 + f32::from(node.story_level) * story_h;
+        let is_stressed = node.damage_state == DamageState::CrackedStressed;
+
+        let tint = |c: Color| -> Color {
+            if is_stressed {
+                let s = c.to_srgba();
+                Color::srgba(s.red * 0.68, s.green * 0.64, s.blue * 0.60, s.alpha)
+            } else {
+                c
+            }
+        };
+
+        match node.kind {
+            StructuralModuleKind::LoadBearingPillar => {
+                parts.push(
+                    IsoExtrudedBox::new(20.0, 14.5, story_h, tint(pillar_col))
+                        .with_offset(local_xy, z0)
+                        .with_shadow(false),
+                );
+                // Cornice band at top of each story pillar
+                parts.push(
+                    IsoExtrudedBox::new(21.5, 15.5, 2.0, tint(trim_col))
+                        .with_offset(local_xy, z0 + story_h - 2.0)
+                        .with_shadow(false),
+                );
+            }
+            StructuralModuleKind::Wall => {
+                parts.push(
+                    IsoExtrudedBox::new(21.0, 15.0, story_h, tint(wall_col))
+                        .with_offset(local_xy, z0)
+                        .with_shadow(false),
+                );
+                // Recessed glazed window on exterior walls
+                if (node.grid_x + node.grid_y).abs() % 2 == 1 {
+                    let glass_col = if is_stressed {
+                        Color::srgb(0.18, 0.22, 0.26)
+                    } else {
+                        Color::srgb(0.32, 0.50, 0.64)
+                    };
+                    parts.push(
+                        IsoExtrudedBox::new(11.0, 9.0, story_h * 0.52, glass_col)
+                            .with_offset(local_xy, z0 + story_h * 0.26)
+                            .with_shadow(false),
+                    );
+                }
+            }
+            StructuralModuleKind::FloorSlab => {
+                parts.push(
+                    IsoExtrudedBox::new(21.2, 15.2, 2.8, tint(trim_col))
+                        .with_offset(local_xy, z0)
+                        .with_shadow(false),
+                );
+            }
+            StructuralModuleKind::RoofCorrugation => {
+                let mut roof_box = IsoExtrudedBox::new(21.4, 15.4, 5.5, tint(roof_col))
+                    .with_offset(local_xy, z0 + story_h - 4.5)
+                    .with_shadow(false);
+                if stories <= 2 && node.grid_y == 0 {
+                    roof_box = roof_box.with_roof_slope(RoofSlopeSpec::Gable {
+                        eave_scale: 0.55,
+                        ridge_scale: 1.25,
+                    });
+                }
+                parts.push(roof_box);
+
+                // Rooftop HVAC unit on center roof module
+                if node.grid_x == 0 && node.grid_y == 0 {
+                    parts.push(
+                        IsoExtrudedBox::new(12.0, 10.0, 6.5, Color::srgb(0.62, 0.66, 0.70))
+                            .with_offset(local_xy, z0 + story_h + 1.0)
+                            .with_shadow(false),
+                    );
+                }
+            }
+        }
+    }
+
+    (
+        base_slab,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
+}
+
+/// Builds a 2.5D multi-box assembly for interior furniture and exterior street props (`Issue #10`).
+#[must_use]
+pub fn build_prop_iso_assembly(archetype: PropArchetype) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let mut parts = Vec::with_capacity(6);
+    let base = match archetype {
+        PropArchetype::PropaneTank => {
+            parts.push(
+                IsoExtrudedBox::new(18.0, 10.0, 9.5, Color::srgb(0.92, 0.88, 0.86))
+                    .with_offset(Vec2::ZERO, 3.0)
+                    .with_shadow(false),
+            );
+            parts.push(
+                IsoExtrudedBox::new(6.0, 10.4, 9.8, Color::srgb(0.88, 0.22, 0.18))
+                    .with_offset(Vec2::ZERO, 3.0)
+                    .with_shadow(false),
+            );
+            parts.push(
+                IsoExtrudedBox::new(4.0, 4.0, 3.2, Color::srgb(0.78, 0.64, 0.22))
+                    .with_offset(Vec2::new(0.0, 0.0), 12.5)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(14.0, 8.0, 3.0, Color::srgb(0.32, 0.32, 0.35))
+        }
+        PropArchetype::FireHydrant => {
+            parts.push(
+                IsoExtrudedBox::new(9.5, 5.5, 3.0, Color::srgb(0.78, 0.78, 0.82))
+                    .with_offset(Vec2::ZERO, 6.5)
+                    .with_shadow(false),
+            );
+            parts.push(
+                IsoExtrudedBox::new(4.5, 4.5, 3.0, Color::srgb(0.92, 0.78, 0.22))
+                    .with_offset(Vec2::ZERO, 11.5)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(6.5, 6.5, 11.5, Color::srgb(0.90, 0.20, 0.16))
+        }
+        PropArchetype::Dumpster => {
+            parts.push(
+                IsoExtrudedBox::new(23.0, 15.0, 2.2, Color::srgb(0.16, 0.17, 0.19))
+                    .with_offset(Vec2::ZERO, 13.5)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(22.0, 14.0, 13.5, Color::srgb(0.20, 0.46, 0.26))
+        }
+        PropArchetype::CashRegister => {
+            parts.push(
+                IsoExtrudedBox::new(6.5, 8.0, 6.0, Color::srgb(0.96, 0.82, 0.24))
+                    .with_offset(Vec2::new(-2.0, 0.0), 5.0)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(11.0, 10.0, 5.0, Color::srgb(0.76, 0.62, 0.18))
+        }
+        PropArchetype::Forklift => {
+            // Mast & forks
+            parts.push(
+                IsoExtrudedBox::new(2.5, 10.0, 16.0, Color::srgb(0.22, 0.23, 0.25))
+                    .with_offset(Vec2::new(8.0, 0.0), 1.0)
+                    .with_shadow(false),
+            );
+            for side in [-1.0_f32, 1.0_f32] {
+                parts.push(
+                    IsoExtrudedBox::new(9.0, 1.8, 1.2, Color::srgb(0.32, 0.33, 0.36))
+                        .with_offset(Vec2::new(12.5, side * 3.2), 1.0)
+                        .with_shadow(false),
+                );
+            }
+            // ROPS cage
+            parts.push(
+                IsoExtrudedBox::new(10.0, 10.0, 8.0, Color::srgb(0.26, 0.28, 0.30))
+                    .with_offset(Vec2::new(-1.0, 0.0), 8.0)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(16.0, 11.0, 8.0, Color::srgb(0.92, 0.64, 0.14))
+        }
+        PropArchetype::Couch => {
+            parts.push(
+                IsoExtrudedBox::new(5.0, 18.0, 6.5, Color::srgb(0.58, 0.28, 0.22))
+                    .with_offset(Vec2::new(-3.5, 0.0), 4.0)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(12.0, 18.0, 4.5, Color::srgb(0.68, 0.34, 0.26))
+        }
+        PropArchetype::Refrigerator => {
+            parts.push(
+                IsoExtrudedBox::new(10.2, 10.2, 5.5, Color::srgb(0.92, 0.95, 0.98))
+                    .with_offset(Vec2::ZERO, 11.5)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(10.0, 10.0, 11.0, Color::srgb(0.84, 0.88, 0.92))
+        }
+        PropArchetype::Toilet => {
+            parts.push(
+                IsoExtrudedBox::new(4.5, 7.5, 7.5, Color::srgb(0.92, 0.95, 0.98))
+                    .with_offset(Vec2::new(-3.0, 0.0), 5.0)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(9.5, 7.0, 5.5, Color::srgb(0.88, 0.92, 0.96))
+        }
+        PropArchetype::GlassDisplayCase => {
+            parts.push(
+                IsoExtrudedBox::new(16.0, 9.0, 6.5, Color::srgb(0.58, 0.82, 0.92))
+                    .with_offset(Vec2::ZERO, 5.0)
+                    .with_shadow(false),
+            );
+            IsoExtrudedBox::new(16.5, 9.5, 5.0, Color::srgb(0.46, 0.34, 0.22))
+        }
+        PropArchetype::ConcreteBarrier => {
+            IsoExtrudedBox::new(22.0, 7.0, 9.5, Color::srgb(0.66, 0.65, 0.62))
+                .with_roof_slope(RoofSlopeSpec::Gable {
+                    eave_scale: 0.70,
+                    ridge_scale: 1.15,
+                })
+        }
+        _ => IsoExtrudedBox::new(12.0, 10.0, 9.0, archetype.color()),
+    };
+
+    (
+        base,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
+}
+
+/// Builds a 2.5D multi-box assembly for a falling structural masonry/rebar debris chunk (`Issue #10`).
+#[must_use]
+pub fn build_debris_iso_assembly(story_level: u8) -> (IsoExtrudedBox, IsoBoxAssembly) {
+    let base_col = if story_level.is_multiple_of(2) {
+        Color::srgb(0.56, 0.44, 0.36)
+    } else {
+        Color::srgb(0.48, 0.46, 0.44)
+    };
+    let base = IsoExtrudedBox::new(11.5, 8.5, 6.5, base_col).with_shadow(true);
+    let parts = vec![
+        IsoExtrudedBox::new(6.0, 5.0, 4.0, Color::srgb(0.36, 0.34, 0.32))
+            .with_offset(Vec2::new(2.5, -1.5), 5.0)
+            .with_shadow(false),
+    ];
+    (
+        base,
+        IsoBoxAssembly {
+            parts,
+            alpha_multiplier: 1.0,
+        },
+    )
+}
+
+/// Spawns a single dynamic debris entity in Cartesian `WorldPose` space and registers it
+/// in the 500-cap ring buffer.
 pub fn spawn_pooled_debris_chunk(
     commands: &mut Commands,
     debris_pool: &mut DebrisPoolRegistry,
@@ -529,8 +815,15 @@ pub fn spawn_pooled_debris_chunk(
     story_level: u8,
 ) -> Entity {
     let safe_pos = sanitize_vec2(world_pos, Vec2::ZERO);
-    let sim_z = f32::from(story_level) * 24.0;
-    let iso_z = compute_stable_iso_z(safe_pos.x, safe_pos.y, sim_z, 5.0);
+    let sim_z = f32::from(story_level) * 18.0 + 6.0;
+    let iso_screen = world_to_iso_screen(safe_pos, sim_z);
+    let iso_z = iso_depth_key(safe_pos, sim_z, ISO_BIAS_DEBRIS);
+    let (base_box, assembly) = build_debris_iso_assembly(story_level);
+
+    // Deterministic radial scatter velocity from hash of coordinates
+    let angle = (safe_pos.x * 0.13 + safe_pos.y * 0.29 + f32::from(story_level) * 1.7).sin()
+        * std::f32::consts::PI;
+    let horiz_vel = Vec2::new(angle.cos() * 24.0, angle.sin() * 24.0);
 
     let debris_entity = commands
         .spawn((
@@ -542,18 +835,23 @@ pub fn spawn_pooled_debris_chunk(
                 active_timer_secs: 4.0,
                 simulated_z_height: sim_z,
                 vertical_z_velocity: -65.0,
+                horizontal_velocity: horiz_vel,
+                spin_rate: 2.2,
             },
-            Sprite {
-                color: Color::srgb(0.52, 0.44, 0.38),
-                custom_size: Some(Vec2::new(14.0, 10.0)),
-                ..Default::default()
-            },
-            Transform::from_xyz(safe_pos.x, safe_pos.y + sim_z, iso_z),
+            WorldPose::new(safe_pos, sim_z, angle),
+            IsoLayerBias(ISO_BIAS_DEBRIS),
+            base_box,
+            assembly,
+            Transform::from_xyz(iso_screen.x, iso_screen.y, iso_z),
             GlobalTransform::default(),
-            RigidBody::Dynamic,
-            Collider::rectangle(12.0, 8.0),
-            LinearVelocity(Vec2::new(0.0, -12.0)),
-            AngularVelocity(0.5),
+            (
+                Position(safe_pos),
+                Rotation::radians(angle),
+                RigidBody::Dynamic,
+                Collider::rectangle(12.0, 8.0),
+                LinearVelocity::default(),
+                AngularVelocity::default(),
+            ),
         ))
         .id();
 
@@ -562,7 +860,8 @@ pub fn spawn_pooled_debris_chunk(
 }
 
 /// Polls in-flight async BFS structural collapse tasks, validates `SessionEpoch` and
-/// `dirty_generation`, and converts orphaned upper stories into falling debris clusters.
+/// `dirty_generation`, converts orphaned upper stories into falling debris clusters, and
+/// rebuilds the building's 2.5D `IsoBoxAssembly`.
 pub fn poll_structural_collapse_tasks_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
@@ -572,15 +871,23 @@ pub fn poll_structural_collapse_tasks_system(
     mut particle_events: EventWriter<ParticleBurstEvent>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
     mut collapse_zones: ResMut<ActiveCollapseZones>,
-    building_transforms: Query<&Transform, With<ModularBuilding>>,
+    mut building_ids: Local<Vec<Entity>>,
+    mut building_query: Query<(
+        Option<&WorldPose>,
+        &Transform,
+        &ModularBuilding,
+        Option<&mut IsoExtrudedBox>,
+        Option<&mut IsoBoxAssembly>,
+    )>,
 ) {
     let current_epoch = *epoch;
     graph_registry.current_epoch = current_epoch;
 
     let task_pool = AsyncComputeTaskPool::get();
-    let building_ids: Vec<Entity> = graph_registry.buildings.keys().copied().collect();
+    building_ids.clear();
+    building_ids.extend(graph_registry.buildings.keys().copied());
 
-    for building_id in building_ids {
+    for &building_id in building_ids.iter() {
         let mut completed_result: Option<CollapseEvalResult> = None;
         let mut needs_followup = false;
 
@@ -603,9 +910,9 @@ pub fn poll_structural_collapse_tasks_system(
                 continue;
             }
 
-            let base_pos = building_transforms
+            let base_pos = building_query
                 .get(building_id)
-                .map(|t| t.translation.truncate())
+                .map(|(pose, tf, _, _, _)| pose.map_or_else(|| tf.translation.truncate(), |p| p.pos))
                 .unwrap_or(Vec2::ZERO);
 
             if let Some(entry) = graph_registry.buildings.get_mut(&building_id)
@@ -642,13 +949,15 @@ pub fn poll_structural_collapse_tasks_system(
                     {
                         node.intact = false;
                         node.damage_state = DamageState::RubbleDebris;
-                        let local_iso =
-                            grid_to_iso_world(node.grid_x, node.grid_y, 0.0).truncate();
-                        let world_xy = base_pos + local_iso * 0.4;
+                        let local_xy =
+                            Vec2::new(node.grid_x as f32 * 21.0, node.grid_y as f32 * 15.0);
+                        let world_xy = base_pos + local_xy;
+                        let screen_xy =
+                            world_to_iso_screen(world_xy, f32::from(node.story_level) * 16.0);
 
                         cash_events.send(DemolitionCashEvent {
                             amount: node.cash_value,
-                            world_pos: world_xy.extend(0.0),
+                            world_pos: screen_xy.extend(0.0),
                         });
 
                         spawn_pooled_debris_chunk(
@@ -659,6 +968,22 @@ pub fn poll_structural_collapse_tasks_system(
                             node.story_level,
                         );
                     }
+                }
+
+                // Rebuild 2.5D building assembly to reflect newly destroyed/stressed nodes
+                if let Ok((_, _, b_meta, Some(mut base_box), Some(mut assembly))) =
+                    building_query.get_mut(building_id)
+                {
+                    let prev_alpha = assembly.alpha_multiplier;
+                    let (mut new_base, mut new_asm) = build_building_iso_assembly(
+                        &entry.nodes,
+                        b_meta.stories,
+                        b_meta.palette_index,
+                    );
+                    new_base.alpha = prev_alpha;
+                    new_asm.alpha_multiplier = prev_alpha;
+                    *base_box = new_base;
+                    *assembly = new_asm;
                 }
             }
 
@@ -674,9 +999,10 @@ pub fn poll_structural_collapse_tasks_system(
     }
 }
 
-/// Updates the 3-Tier Debris Lifecycle:
+/// Updates the 3-Tier Debris Lifecycle in Cartesian `WorldPose` space:
 /// - Tier 1 (`ActivePhysics`) -> Tier 2 (`SleepingInstanced`) once velocity settles or timer expires
 /// - Updates `DebugTelemetry` counts for the HUD Debug overlay
+#[allow(clippy::type_complexity)]
 pub fn update_debris_lifecycle_system(
     mut commands: Commands,
     time: Res<Time>,
@@ -687,6 +1013,9 @@ pub fn update_debris_lifecycle_system(
     mut debris_query: Query<(
         Entity,
         &mut DebrisChunk,
+        Option<&mut WorldPose>,
+        Option<&mut Position>,
+        Option<&mut Rotation>,
         &mut Transform,
         Option<&LinearVelocity>,
     )>,
@@ -698,34 +1027,80 @@ pub fn update_debris_lifecycle_system(
     let mut active_count: usize = 0;
     let mut sleeping_count: usize = 0;
 
-    for (entity, mut chunk, mut transform, lin_vel) in &mut debris_query {
+    for (entity, mut chunk, mut world_pose, mut phys_pos, mut phys_rot, mut transform, lin_vel) in
+        &mut debris_query
+    {
         match chunk.tier {
             DebrisTier::ActivePhysics => {
                 active_count = active_count.saturating_add(1);
                 chunk.active_timer_secs -= dt;
+
+                if let (Some(pose), Some(pos)) = (world_pose.as_deref_mut(), phys_pos.as_deref()) {
+                    pose.pos = sanitize_vec2(pos.0, pose.pos);
+                }
+
                 if chunk.simulated_z_height > 0.0 {
                     chunk.vertical_z_velocity =
                         sanitize_f32(chunk.vertical_z_velocity - 180.0 * dt, -65.0);
                     let dz = chunk.vertical_z_velocity * dt;
                     chunk.simulated_z_height = (chunk.simulated_z_height + dz).max(0.0);
-                    transform.translation.y =
-                        sanitize_f32(transform.translation.y + dz, transform.translation.y);
+
+                    if let Some(pose) = world_pose.as_deref_mut() {
+                        pose.pos = sanitize_vec2(
+                            pose.pos + chunk.horizontal_velocity * dt,
+                            pose.pos,
+                        );
+                        pose.elev_z = chunk.simulated_z_height;
+                        pose.heading_rad = sanitize_f32(
+                            pose.heading_rad + chunk.spin_rate * dt,
+                            pose.heading_rad,
+                        );
+                        pose.pitch_rad = (chunk.simulated_z_height * 0.08).sin() * 0.35;
+                    } else {
+                        transform.translation.y =
+                            sanitize_f32(transform.translation.y + dz, transform.translation.y);
+                    }
+                } else if let Some(pose) = world_pose.as_deref_mut() {
+                    pose.elev_z = 0.0;
+                    pose.pitch_rad = 0.0;
+                    chunk.horizontal_velocity *= (1.0 - dt * 6.0).clamp(0.0, 1.0);
+                    pose.pos = sanitize_vec2(
+                        pose.pos + chunk.horizontal_velocity * dt,
+                        pose.pos,
+                    );
                 }
 
-                let speed_sq =
+                if let Some(pose) = world_pose.as_deref() {
+                    if let Some(pos) = phys_pos.as_deref_mut() {
+                        pos.0 = pose.pos;
+                    }
+                    if let Some(rot) = phys_rot.as_deref_mut() {
+                        *rot = Rotation::radians(pose.heading_rad);
+                    }
+                }
+
+                let custom_speed_sq =
+                    sanitize_vec2(chunk.horizontal_velocity, Vec2::ZERO).length_squared();
+                let solver_speed_sq =
                     lin_vel.map_or(0.0, |v| sanitize_vec2(v.0, Vec2::ZERO).length_squared());
+                let speed_sq = custom_speed_sq.max(solver_speed_sq);
                 let settled = chunk.active_timer_secs <= 0.0
                     || (chunk.simulated_z_height <= 0.01 && speed_sq < 4.0);
 
                 if settled {
                     chunk.tier = DebrisTier::SleepingInstanced;
-                    road_graph.mark_rubble_obstruction(transform.translation.truncate(), 28.0);
+                    let world_xy = world_pose
+                        .as_deref()
+                        .map_or_else(|| transform.translation.truncate(), |p| p.pos);
+                    road_graph.mark_rubble_obstruction(world_xy, 28.0);
                     debris_pool.active_ring.retain(|&e| e != entity);
 
                     if let Some(mut entity_cmds) = commands.get_entity(entity) {
                         entity_cmds
                             .remove::<RigidBody>()
                             .remove::<Collider>()
+                            .remove::<Position>()
+                            .remove::<Rotation>()
                             .remove::<LinearVelocity>()
                             .remove::<AngularVelocity>()
                             .insert(DebrisTier::SleepingInstanced);
@@ -756,13 +1131,13 @@ pub fn update_debris_lifecycle_system(
 }
 
 /// Spawns initial modular buildings, interior flooring, interior furniture, and exterior street
-/// props for the active campaign level (`.ron` manifest) if none exist for `SessionEpoch`.
+/// props in Cartesian `WorldPose` space with 2.5D multi-box assemblies (`Issues #7 and #10`).
 pub fn ensure_site_buildings_spawned_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
     env_config: Res<EnvironmentConfig>,
     manifest: Res<CampaignPrefabsManifest>,
-    atlas: Res<ProceduralWorldAtlas>,
+    _atlas: Res<ProceduralWorldAtlas>,
     mut graph_registry: ResMut<BuildingGraphRegistry>,
     existing_buildings: Query<Entity, With<ModularBuilding>>,
 ) {
@@ -809,32 +1184,18 @@ pub fn ensure_site_buildings_spawned_system(
             .cloned()
             .unwrap_or_else(|| env_config.level.label().to_string());
 
-        // Spawn interior checkerboard floor layer (revealed when roof cutaway fades!)
-        let mut floor_sprite = Sprite {
-            color: Color::srgb(0.84, 0.80, 0.72),
-            custom_size: Some(Vec2::new(104.0, 74.0)),
-            ..Default::default()
-        };
-        if let (Some(tex), Some(layout)) = (&atlas.texture, &atlas.layout) {
-            floor_sprite.image = tex.clone();
-            floor_sprite.texture_atlas = Some(TextureAtlas {
-                layout: layout.clone(),
-                index: validate_atlas_index(
-                    atlas_indices::FLOOR_CHECKER,
-                    MAX_PROCEDURAL_ATLAS_INDEX,
-                ) as usize,
-            });
-        }
+        // Spawn 2.5D interior floor slab (revealed when exterior/roof cutaway fades!)
+        let floor_iso = world_to_iso_screen(offset, 0.5);
+        let floor_z = iso_depth_key(offset, 0.5, ISO_BIAS_INTERIOR_FLOOR);
         commands.spawn((
             Name::new(format!("Building #{idx} Interior Flooring")),
             SiteScoped { epoch: *epoch },
-            floor_sprite,
-            Transform::from_xyz(
-                offset.x,
-                offset.y,
-                compute_stable_iso_z(offset.x, offset.y, 1.0, 2.0),
-            ),
+            WorldPose::new(offset, 0.5, 0.0),
+            IsoLayerBias(ISO_BIAS_INTERIOR_FLOOR),
+            IsoExtrudedBox::new(104.0, 74.0, 1.8, Color::srgb(0.82, 0.78, 0.68)).with_shadow(false),
+            Transform::from_xyz(floor_iso.x, floor_iso.y, floor_z),
             GlobalTransform::default(),
+            Visibility::default(),
         ));
 
         // Spawn 4 interior furniture pieces inside this building footprint
@@ -848,6 +1209,10 @@ pub fn ensure_site_buildings_spawned_system(
                 ((p_i / 2) as f32 - 0.5) * 28.0,
             );
             let prop_pos = offset + local_offset;
+            let prop_iso = world_to_iso_screen(prop_pos, 2.0);
+            let prop_z = iso_depth_key(prop_pos, 2.0, ISO_BIAS_PROP);
+            let (prop_base, prop_asm) = build_prop_iso_assembly(prop_arch);
+
             commands.spawn((
                 Name::new(format!("Interior Prop ({prop_arch:?})")),
                 SiteScoped { epoch: *epoch },
@@ -855,34 +1220,20 @@ pub fn ensure_site_buildings_spawned_system(
                     archetype: prop_arch,
                     is_interior: true,
                 },
-                Sprite {
-                    color: prop_arch.color(),
-                    custom_size: Some(Vec2::new(14.0, 14.0)),
-                    ..Default::default()
-                },
-                Transform::from_xyz(
-                    prop_pos.x,
-                    prop_pos.y,
-                    compute_stable_iso_z(prop_pos.x, prop_pos.y, 4.0, 4.0),
-                ),
+                WorldPose::new(prop_pos, 2.0, 0.0),
+                IsoLayerBias(ISO_BIAS_PROP),
+                prop_base,
+                prop_asm,
+                Transform::from_xyz(prop_iso.x, prop_iso.y, prop_z),
                 GlobalTransform::default(),
+                Visibility::default(),
             ));
         }
 
-        // Spawn building roof/exterior cutaway hull
-        let mut hull_sprite = Sprite {
-            color: Color::srgb(0.72, 0.38, 0.30),
-            custom_size: Some(Vec2::new(112.0, 84.0 + f32::from(stories) * 18.0)),
-            ..Default::default()
-        };
-        if let (Some(tex), Some(layout)) = (&atlas.texture, &atlas.layout) {
-            hull_sprite.image = tex.clone();
-            hull_sprite.texture_atlas = Some(TextureAtlas {
-                layout: layout.clone(),
-                index: validate_atlas_index(atlas_indices::WALL_INTACT, MAX_PROCEDURAL_ATLAS_INDEX)
-                    as usize,
-            });
-        }
+        let entry = BuildingGraphEntry::new(*epoch, nodes);
+        let (b_base, b_asm) = build_building_iso_assembly(&entry.nodes, stories, idx);
+        let b_iso = world_to_iso_screen(offset, 0.0);
+        let b_z = iso_depth_key(offset, f32::from(stories) * 16.0, ISO_BIAS_BUILDING);
 
         let b_entity = commands
             .spawn((
@@ -891,6 +1242,7 @@ pub fn ensure_site_buildings_spawned_system(
                 ModularBuilding {
                     archetype_name,
                     stories,
+                    palette_index: idx,
                 },
                 CutawayFootprint {
                     min_world: offset - Vec2::splat(72.0),
@@ -898,21 +1250,23 @@ pub fn ensure_site_buildings_spawned_system(
                     exterior_breached: false,
                     current_roof_alpha: 1.0,
                 },
-                hull_sprite,
-                Transform::from_xyz(
-                    offset.x,
-                    offset.y,
-                    compute_stable_iso_z(offset.x, offset.y, f32::from(stories) * 16.0, 10.0),
-                ),
+                WorldPose::new(offset, 0.0, 0.0),
+                IsoLayerBias(ISO_BIAS_BUILDING),
+                b_base,
+                b_asm,
+                Transform::from_xyz(b_iso.x, b_iso.y, b_z),
                 GlobalTransform::default(),
-                RigidBody::Static,
-                Collider::rectangle(108.0, 76.0),
+                Visibility::default(),
+                (
+                    Position(offset),
+                    Rotation::IDENTITY,
+                    RigidBody::Static,
+                    Collider::rectangle(108.0, 76.0),
+                ),
             ))
             .id();
 
-        graph_registry
-            .buildings
-            .insert(b_entity, BuildingGraphEntry::new(*epoch, nodes));
+        graph_registry.buildings.insert(b_entity, entry);
     }
 
     // Spawn exterior street props (PropaneTanks, FireHydrants, Dumpsters, Mailboxes)
@@ -926,6 +1280,9 @@ pub fn ensure_site_buildings_spawned_system(
     ];
 
     for (arch, pos) in exterior_specs {
+        let prop_iso = world_to_iso_screen(pos, 0.0);
+        let prop_z = iso_depth_key(pos, 6.0, ISO_BIAS_PROP);
+        let (prop_base, prop_asm) = build_prop_iso_assembly(arch);
         commands.spawn((
             Name::new(format!("Exterior Street Prop ({arch:?})")),
             SiteScoped { epoch: *epoch },
@@ -933,13 +1290,13 @@ pub fn ensure_site_buildings_spawned_system(
                 archetype: arch,
                 is_interior: false,
             },
-            Sprite {
-                color: arch.color(),
-                custom_size: Some(Vec2::new(16.0, 18.0)),
-                ..Default::default()
-            },
-            Transform::from_xyz(pos.x, pos.y, compute_stable_iso_z(pos.x, pos.y, 6.0, 6.0)),
+            WorldPose::new(pos, 0.0, 0.0),
+            IsoLayerBias(ISO_BIAS_PROP),
+            prop_base,
+            prop_asm,
+            Transform::from_xyz(prop_iso.x, prop_iso.y, prop_z),
             GlobalTransform::default(),
+            Visibility::default(),
         ));
     }
 }
@@ -1075,5 +1432,64 @@ mod tests {
         );
         // All 9 upper-story nodes (3x3 at story_level == 1) must be identified as orphaned
         assert_eq!(res.orphaned_nodes.len(), 9);
+    }
+
+    #[test]
+    fn test_debris_chunk_damps_horizontal_velocity_before_settling() {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<RoadSplineGraph>()
+            .init_resource::<DebrisPoolRegistry>()
+            .init_resource::<BuildingGraphRegistry>()
+            .init_resource::<DebugTelemetry>()
+            .add_systems(Update, update_debris_lifecycle_system);
+
+        let entity = app
+            .world_mut()
+            .spawn((
+                DebrisTier::ActivePhysics,
+                DebrisChunk {
+                    tier: DebrisTier::ActivePhysics,
+                    active_timer_secs: 4.0,
+                    simulated_z_height: 0.0,
+                    vertical_z_velocity: 0.0,
+                    horizontal_velocity: Vec2::new(24.0, 0.0),
+                    spin_rate: 2.2,
+                },
+                WorldPose::new(Vec2::ZERO, 0.0, 0.0),
+                Position(Vec2::ZERO),
+                Rotation::IDENTITY,
+                Transform::default(),
+                LinearVelocity::default(),
+            ))
+            .id();
+
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(16));
+        app.update();
+
+        // After a single ground-level tick, horizontal_velocity (24.0 -> ~21.7) is still well above
+        // the settlement threshold (speed_sq < 4.0), even though LinearVelocity is zero.
+        let chunk_after_1 = app.world().get::<DebrisChunk>(entity);
+        assert!(chunk_after_1.is_some());
+        if let Some(chunk) = chunk_after_1 {
+            assert_eq!(chunk.tier, DebrisTier::ActivePhysics);
+            assert!(chunk.horizontal_velocity.x > 18.0 && chunk.horizontal_velocity.x < 24.0);
+        }
+
+        // Advance enough ticks for ground damping to decay horizontal_velocity below 2.0 (speed_sq < 4.0)
+        for _ in 0..45 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(16));
+            app.update();
+        }
+
+        let chunk_settled = app.world().get::<DebrisChunk>(entity);
+        assert!(chunk_settled.is_some());
+        if let Some(chunk) = chunk_settled {
+            assert_eq!(chunk.tier, DebrisTier::SleepingInstanced);
+        }
     }
 }
