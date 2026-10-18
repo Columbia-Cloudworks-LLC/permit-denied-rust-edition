@@ -716,10 +716,14 @@ pub fn handle_hud_button_interactions_system(
                 }
             }
             HudButtonAction::RestartSite => {
-                next_state.set(AppState::Playing);
-                restart_writer.send(SiteRestartRequested {
-                    preserve_layout: true,
-                });
+                if !(env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices > 0)
+                {
+                    next_state.set(AppState::Playing);
+                    restart_writer.send(SiteRestartRequested {
+                        preserve_layout: true,
+                    });
+                }
             }
             HudButtonAction::OpenNewGameModal => {
                 next_state.set(AppState::NewGameModal);
@@ -943,6 +947,8 @@ pub fn update_industrial_hud_system(
     )>,
 ) {
     if let Some(keys) = keys {
+        let has_pending_campaign_upgrade =
+            env_config.mode == GameMode::Campaign && progression.pending_upgrade_choices > 0;
         if keys.just_pressed(KeyCode::Enter)
             && (*app_state.get() == AppState::Title || *app_state.get() == AppState::NewGameModal)
         {
@@ -959,9 +965,7 @@ pub fn update_industrial_hud_system(
             match app_state.get() {
                 AppState::Playing => next_state.set(AppState::Paused),
                 AppState::Paused => {
-                    if !(env_config.mode == GameMode::Campaign
-                        && progression.pending_upgrade_choices > 0)
-                    {
+                    if !has_pending_campaign_upgrade {
                         next_state.set(AppState::Playing);
                     }
                 }
@@ -971,12 +975,12 @@ pub fn update_industrial_hud_system(
         if keys.just_pressed(KeyCode::F3) {
             telemetry.debug_overlay_visible = !telemetry.debug_overlay_visible;
         }
-        if keys.just_pressed(KeyCode::KeyB) {
+        if keys.just_pressed(KeyCode::KeyB) && !has_pending_campaign_upgrade {
             restart_writer.send(SiteRestartRequested {
                 preserve_layout: true,
             });
         }
-        if keys.just_pressed(KeyCode::Tab) {
+        if keys.just_pressed(KeyCode::Tab) && !has_pending_campaign_upgrade {
             env_config.level = env_config.level.next();
             restart_writer.send(SiteRestartRequested {
                 preserve_layout: false,
@@ -1094,6 +1098,9 @@ impl Plugin for PdUiPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bevy::state::app::StatesPlugin;
+    use pd_core::PdCorePlugin;
+    use pd_dozer::PdDozerPlugin;
 
     #[test]
     fn test_gauge_needle_and_odometer_formatting_extremes() {
@@ -1110,5 +1117,70 @@ mod tests {
 
         ledger.odometer_display_value = f32::NAN;
         assert_eq!(format_odometer_string(&ledger), "$000,000");
+    }
+
+    #[test]
+    fn test_pending_campaign_upgrade_guards_escape_and_restart_shortcuts() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            StatesPlugin,
+            PdCorePlugin,
+            PdDozerPlugin,
+            PdUiPlugin,
+        ));
+        app.init_resource::<ButtonInput<KeyCode>>();
+        app.update();
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Paused);
+        app.update();
+
+        let initial_level = pd_core::CampaignLevel::default();
+        {
+            let mut env = app.world_mut().resource_mut::<EnvironmentConfig>();
+            env.mode = GameMode::Campaign;
+            env.level = initial_level;
+        }
+        {
+            let mut prog = app.world_mut().resource_mut::<UpgradeProgression>();
+            prog.pending_upgrade_choices = 1;
+        }
+
+        // Pressing Escape, B (retry), or Tab (level advance) while an upgrade is pending must be ignored
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::Escape);
+            keys.press(KeyCode::KeyB);
+            keys.press(KeyCode::Tab);
+        }
+        app.update();
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::Escape);
+            keys.release(KeyCode::KeyB);
+            keys.release(KeyCode::Tab);
+            keys.clear();
+        }
+        app.update();
+
+        assert_eq!(
+            *app.world().resource::<State<AppState>>().get(),
+            AppState::Paused,
+            "Campaign upgrade modal must remain Paused when Escape/B/Tab are pressed"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<UpgradeProgression>()
+                .pending_upgrade_choices,
+            1,
+            "Pending upgrade choice must not be cleared by B/Tab shortcuts"
+        );
+        assert_eq!(
+            app.world().resource::<EnvironmentConfig>().level,
+            initial_level,
+            "Tab shortcut must not advance level while an upgrade choice is pending"
+        );
     }
 }
