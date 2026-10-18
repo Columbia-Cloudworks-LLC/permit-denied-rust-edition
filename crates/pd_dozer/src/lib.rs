@@ -135,8 +135,40 @@ pub struct PlayerVehicle {
     pub ride_roll: f32,
     pub last_impact: f32,
     pub odometer_dist: f32,
+    pub blade_shear_multiplier: f32,
+    pub pushing_force_multiplier: f32,
+    pub blade_shear_carry: f32,
     pub distance_since_last_tread_decal: f32,
     pub exhaust_smoke_timer: f32,
+}
+
+impl PlayerVehicle {
+    /// Computes the number of intact ground-story structural nodes sheared by a blade/hull impact
+    /// while preserving fractional `AR400 Edge` (`+42%` per level) increments via `blade_shear_carry`.
+    pub fn consume_blade_shear_nodes(
+        &mut self,
+        blade_state: BladeState,
+        upgrades: &UpgradeMultipliers,
+    ) -> usize {
+        match blade_state {
+            BladeState::BladeUp => 1,
+            BladeState::BladeDown => {
+                let fallback_mul = upgrades.sanitized().ar400_edge;
+                let raw_mul = if self.blade_shear_multiplier > 1.0 {
+                    self.blade_shear_multiplier.max(fallback_mul)
+                } else {
+                    fallback_mul
+                };
+                let shear_mul = sanitize_f32(raw_mul, 1.0).clamp(1.0, MAX_SAFE_MULTIPLIER);
+                let carry = sanitize_f32(self.blade_shear_carry, 0.0).clamp(-0.5, 0.5);
+                let exact_nodes = 2.0 * shear_mul + carry;
+                let rounded = sanitize_f32(exact_nodes.round(), 2.0).clamp(2.0, 12.0);
+                self.blade_shear_carry =
+                    sanitize_f32(exact_nodes - rounded, 0.0).clamp(-0.5, 0.5);
+                rounded as usize
+            }
+        }
+    }
 }
 
 /// Marker component for the articulating hydraulic AR400 blade visual child sprite.
@@ -732,7 +764,7 @@ pub fn compute_skid_steer_kinematics(
 
     let scrub = (yaw.abs() / BASE_YAW_RATE).clamp(0.0, 1.0);
     let push_surge = if push_active_for_step {
-        DOZER_PUSH_FORCE * safe_dt
+        DOZER_PUSH_FORCE * push_mul * safe_dt
     } else {
         0.0
     };
@@ -774,8 +806,8 @@ pub fn compute_skid_steer_kinematics(
     let lat_scale = (1.0 - DOZER_LATERAL_GRIP * safe_dt).max(0.0);
     let mut linear_velocity = f * next_along + lat_vec * lat_scale;
 
-    // 6. Cap forward or reverse top speed (`capDozerSpeed` in `dozer.ts`).
-    let max_speed = if throttle < 0.0 {
+    // 6. Cap forward or reverse top speed (`capDozerSpeed` in `dozer.ts`) from resulting travel direction.
+    let max_speed = if next_along < 0.0 {
         BASE_MAX_REVERSE_SPEED * breakdown_factor
     } else {
         BASE_TOP_SPEED
@@ -890,14 +922,14 @@ pub fn build_dozer_iso_assembly(blade_state: BladeState) -> (IsoExtrudedBox, Iso
         );
         parts.push(
             IsoExtrudedBox::new(30.0, 5.2, 5.0, Color::srgb(0.75, 0.56, 0.13))
-                .with_offset(Vec2::new(0.0, track_across), 0.0)
+                .with_offset(Vec2::new(0.0, track_across), 2.2)
                 .with_shadow(false),
         );
         // Front & rear sprocket/idler hubs
         for end in [-1.0_f32, 1.0_f32] {
             parts.push(
                 IsoExtrudedBox::new(6.8, 6.2, 6.8, Color::srgb(0.29, 0.25, 0.19))
-                    .with_offset(Vec2::new(end * 15.0, track_across), 0.0)
+                    .with_offset(Vec2::new(end * 15.0, track_across), 1.4)
                     .with_shadow(false),
             );
         }
@@ -905,7 +937,7 @@ pub fn build_dozer_iso_assembly(blade_state: BladeState) -> (IsoExtrudedBox, Iso
         for g in -3..=3 {
             parts.push(
                 IsoExtrudedBox::new(1.8, 7.8, 0.9, Color::srgb(0.24, 0.25, 0.27))
-                    .with_offset(Vec2::new(g as f32 * 5.2, track_across), 0.0)
+                    .with_offset(Vec2::new(g as f32 * 5.2, track_across), 9.4)
                     .with_shadow(false),
             );
         }
@@ -1173,39 +1205,41 @@ pub fn evaluate_upgrade_milestones_and_hotkeys_system(
     mut progression: ResMut<UpgradeProgression>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
 ) {
-    let unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
-    if unlocked > 0 && env_config.mode == GameMode::Campaign && *app_state.get() == AppState::Playing
-    {
-        next_state.set(AppState::Paused);
-    }
-
-    let Some(keys) = keys else {
-        return;
-    };
-
+    let _unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
     let state = *app_state.get();
-    if state != AppState::Playing && state != AppState::Paused {
-        return;
+
+    let mut choice_applied = false;
+    if (state == AppState::Playing || state == AppState::Paused)
+        && let Some(keys) = keys
+    {
+        let maybe_choice =
+            if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1) {
+                Some(UpgradeChoice::Ar400Edge)
+            } else if keys.just_pressed(KeyCode::Digit2) || keys.just_pressed(KeyCode::Numpad2) {
+                Some(UpgradeChoice::ChargeAirKit)
+            } else if keys.just_pressed(KeyCode::Digit3) || keys.just_pressed(KeyCode::Numpad3) {
+                Some(UpgradeChoice::AuxRam)
+            } else {
+                None
+            };
+
+        if let Some(choice) = maybe_choice
+            && progression.try_apply_choice(&mut upgrades, env_config.mode, choice)
+        {
+            choice_applied = true;
+            audio_events.send(AudioTriggerEvent {
+                kind: AudioSfxKind::CashDing,
+            });
+        }
     }
 
-    let maybe_choice = if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1)
-    {
-        Some(UpgradeChoice::Ar400Edge)
-    } else if keys.just_pressed(KeyCode::Digit2) || keys.just_pressed(KeyCode::Numpad2) {
-        Some(UpgradeChoice::ChargeAirKit)
-    } else if keys.just_pressed(KeyCode::Digit3) || keys.just_pressed(KeyCode::Numpad3) {
-        Some(UpgradeChoice::AuxRam)
-    } else {
-        None
-    };
-
-    if let Some(choice) = maybe_choice
-        && progression.try_apply_choice(&mut upgrades, env_config.mode, choice)
-    {
-        audio_events.send(AudioTriggerEvent {
-            kind: AudioSfxKind::CashDing,
-        });
-        if state == AppState::Paused && progression.pending_upgrade_choices == 0 {
+    if env_config.mode == GameMode::Campaign {
+        if progression.pending_upgrade_choices > 0 && state == AppState::Playing {
+            next_state.set(AppState::Paused);
+        } else if choice_applied
+            && progression.pending_upgrade_choices == 0
+            && state == AppState::Paused
+        {
             next_state.set(AppState::Playing);
         }
     }
@@ -1312,6 +1346,8 @@ pub fn fixed_dozer_kinematics_system(
     vehicle.roll = output.roll;
     vehicle.roll_vel = output.roll_vel;
     vehicle.odometer_dist = output.odometer_dist;
+    vehicle.blade_shear_multiplier = output.blade_shear_multiplier;
+    vehicle.pushing_force_multiplier = output.pushing_force_multiplier;
 
     track_input.vx = output.linear_velocity.x;
     track_input.vy = output.linear_velocity.y;
@@ -1661,6 +1697,16 @@ mod tests {
         assert!(peak_speed > BASE_TOP_SPEED * 1.05);
         assert!(peak_speed <= BASE_TOP_SPEED * DOZER_PUSH_SPEED_CAP_MUL + 0.5);
 
+        // Verify Aux Ram (+35%) produces strictly higher 1-tick powered-push surge acceleration than 1.0x baseline
+        let base_up = UpgradeMultipliers::default();
+        let mut base_in = TrackInput::from_throttle_steer(1.0, 0.0, true);
+        let mut ram_in = TrackInput::from_throttle_steer(1.0, 0.0, true);
+        let base_step1 = step_virtual_dozer(&mut base_in, &base_up, &mut stress, dt);
+        let ram_step1 = step_virtual_dozer(&mut ram_in, &upgrades, &mut stress, dt);
+        if let (Ok(b_out), Ok(r_out)) = (base_step1, ram_step1) {
+            assert!(r_out.linear_velocity.x > b_out.linear_velocity.x + 1.5);
+        }
+
         // Verify 5 blade contact points extend forward when blade_down is true and are always finite
         let pts_up = compute_blade_contact_points(Vec2::new(10.0, 20.0), 0.0, false);
         let pts_down = compute_blade_contact_points(Vec2::new(10.0, 20.0), 0.0, true);
@@ -1672,6 +1718,15 @@ mod tests {
         // Non-finite inputs to compute_blade_contact_points sanitize cleanly
         let pts_nan = compute_blade_contact_points(Vec2::splat(f32::NAN), f32::INFINITY, true);
         assert!(pts_nan.iter().all(|p| p.is_finite()));
+
+        // Verify top grouser bars in build_dozer_iso_assembly sit at z0 = 9.4 (protruding above 9.5-unit track shell)
+        let (_, asm) = build_dozer_iso_assembly(BladeState::BladeUp);
+        let raised_grousers = asm
+            .parts
+            .iter()
+            .filter(|b| (b.height - 0.9).abs() < 1e-3 && (b.z0 - 9.4).abs() < 1e-3)
+            .count();
+        assert_eq!(raised_grousers, 14);
     }
 
     #[test]
@@ -1696,11 +1751,13 @@ mod tests {
         assert!(d.pitch.abs() < 0.005);
         assert!((d.vx - BASE_TOP_SPEED).abs() < 0.5);
 
-        // Brake / reverse: nose dips positive
+        // Brake / reverse: first braking tick preserves forward momentum (> 130.0) instead of clamping to BASE_MAX_REVERSE_SPEED (73.6)
         let rev_cmd = TrackInput::from_throttle_steer(-1.0, 0.0, false);
         d.left_track = rev_cmd.left_track;
         d.right_track = rev_cmd.right_track;
-        for _ in 0..6 {
+        let _ = step_virtual_dozer(&mut d, &upgrades, &mut stress, dt);
+        assert!(d.vx > BASE_MAX_REVERSE_SPEED + 50.0);
+        for _ in 0..5 {
             let _ = step_virtual_dozer(&mut d, &upgrades, &mut stress, dt);
         }
         assert!(d.pitch > 0.01);
@@ -1752,6 +1809,24 @@ mod tests {
     fn test_issue_13_milestone_upgrades_and_campaign_level_retry_vs_advance() {
         let mut upgrades = UpgradeMultipliers::default();
         let mut prog = UpgradeProgression::default();
+
+        // Verify each AR400 Edge level (0 -> 1 -> 2 -> 3) strictly increases single-hit & multi-hit node shear
+        let mut veh0 = PlayerVehicle::default();
+        let mut veh1 = PlayerVehicle::default();
+        let mut veh2 = PlayerVehicle::default();
+        let mut veh3 = PlayerVehicle::default();
+        let up0 = UpgradeMultipliers::from_levels(0, 0, 0);
+        let up1 = UpgradeMultipliers::from_levels(1, 0, 0);
+        let up2 = UpgradeMultipliers::from_levels(2, 0, 0);
+        let up3 = UpgradeMultipliers::from_levels(3, 0, 0);
+        let n0 = veh0.consume_blade_shear_nodes(BladeState::BladeDown, &up0);
+        let n1 = veh1.consume_blade_shear_nodes(BladeState::BladeDown, &up1);
+        let n2 = veh2.consume_blade_shear_nodes(BladeState::BladeDown, &up2);
+        let n3 = veh3.consume_blade_shear_nodes(BladeState::BladeDown, &up3);
+        assert_eq!(n0, 2);
+        assert_eq!(n1, 3);
+        assert_eq!(n2, 4);
+        assert_eq!(n3, 5);
 
         // Cross first milestone ($350) in Campaign mode
         assert_eq!(prog.evaluate_cash_milestones(350), 1);

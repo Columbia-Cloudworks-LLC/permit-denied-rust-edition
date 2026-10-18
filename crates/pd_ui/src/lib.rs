@@ -699,11 +699,21 @@ pub fn handle_hud_button_interactions_system(
             }
             HudButtonAction::TogglePause => match app_state.get() {
                 AppState::Playing => next_state.set(AppState::Paused),
-                AppState::Paused => next_state.set(AppState::Playing),
+                AppState::Paused => {
+                    if !(env_config.mode == GameMode::Campaign
+                        && progression.pending_upgrade_choices > 0)
+                    {
+                        next_state.set(AppState::Playing);
+                    }
+                }
                 AppState::Title | AppState::NewGameModal => {}
             },
             HudButtonAction::ResumeGame => {
-                next_state.set(AppState::Playing);
+                if !(env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices > 0)
+                {
+                    next_state.set(AppState::Playing);
+                }
             }
             HudButtonAction::RestartSite => {
                 next_state.set(AppState::Playing);
@@ -757,7 +767,8 @@ pub fn handle_hud_button_interactions_system(
                     &mut upgrades,
                     env_config.mode,
                     UpgradeChoice::Ar400Edge,
-                ) && progression.pending_upgrade_choices == 0
+                ) && env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices == 0
                 {
                     next_state.set(AppState::Playing);
                 }
@@ -767,7 +778,8 @@ pub fn handle_hud_button_interactions_system(
                     &mut upgrades,
                     env_config.mode,
                     UpgradeChoice::ChargeAirKit,
-                ) && progression.pending_upgrade_choices == 0
+                ) && env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices == 0
                 {
                     next_state.set(AppState::Playing);
                 }
@@ -777,7 +789,8 @@ pub fn handle_hud_button_interactions_system(
                     &mut upgrades,
                     env_config.mode,
                     UpgradeChoice::AuxRam,
-                ) && progression.pending_upgrade_choices == 0
+                ) && env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices == 0
                 {
                     next_state.set(AppState::Playing);
                 }
@@ -909,8 +922,8 @@ pub fn update_industrial_hud_system(
     popup_pool: Res<CashPopupPool>,
     clock: Res<ElapsedClock>,
     blade_state: Res<BladeState>,
-    upgrades: Res<UpgradeMultipliers>,
-    progression: Res<UpgradeProgression>,
+    mut upgrades: ResMut<UpgradeMultipliers>,
+    mut progression: ResMut<UpgradeProgression>,
     stress: Res<MechanicalStress>,
     mut telemetry: ResMut<DebugTelemetry>,
     mut restart_writer: EventWriter<SiteRestartRequested>,
@@ -933,6 +946,7 @@ pub fn update_industrial_hud_system(
         if keys.just_pressed(KeyCode::Enter)
             && (*app_state.get() == AppState::Title || *app_state.get() == AppState::NewGameModal)
         {
+            progression.reset_new_game(&mut upgrades, env_config.level);
             next_state.set(AppState::Playing);
             restart_writer.send(SiteRestartRequested {
                 preserve_layout: false,
@@ -944,7 +958,13 @@ pub fn update_industrial_hud_system(
         if keys.just_pressed(KeyCode::Escape) {
             match app_state.get() {
                 AppState::Playing => next_state.set(AppState::Paused),
-                AppState::Paused => next_state.set(AppState::Playing),
+                AppState::Paused => {
+                    if !(env_config.mode == GameMode::Campaign
+                        && progression.pending_upgrade_choices > 0)
+                    {
+                        next_state.set(AppState::Playing);
+                    }
+                }
                 AppState::Title | AppState::NewGameModal => {}
             }
         }

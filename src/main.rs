@@ -264,17 +264,16 @@ pub fn evaluate_dozer_structural_impacts_system(
     );
     let blade_down = *blade_state == BladeState::BladeDown;
     let blade_points = compute_blade_contact_points(dozer_xy, dozer_heading, blade_down);
+    let push_force_mul = dozer_veh
+        .pushing_force_multiplier
+        .max(upgrades.sanitized().aux_ram)
+        .clamp(1.0, pd_dozer::MAX_SAFE_MULTIPLIER);
     let slam_bonus = if dozer_veh.blade_landed_this_tick {
-        10.0
+        10.0 * push_force_mul
     } else {
         0.0
     };
     let task_pool = AsyncComputeTaskPool::get();
-
-    let max_nodes_per_hit: usize = match *blade_state {
-        BladeState::BladeUp => 1,
-        BladeState::BladeDown => (upgrades.sanitized().ar400_edge.round() as usize).clamp(2, 6),
-    };
 
     let mut contact_load = 0.0_f32;
 
@@ -292,6 +291,7 @@ pub fn evaluate_dozer_structural_impacts_system(
             continue;
         }
 
+        let max_nodes_per_hit = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
         destroyed_ids.clear();
         if let Some(entry) = graph_registry.buildings.get(&b_entity) {
             for (&id, node) in &entry.nodes {
@@ -307,6 +307,7 @@ pub fn evaluate_dozer_structural_impacts_system(
         if !destroyed_ids.is_empty() {
             contact_load += 1.5;
             let recoil_dir = (dozer_xy - b_xy).normalize_or_zero();
+            let recoil_bounce = (0.12 / push_force_mul).clamp(0.02, 0.12);
             let veh = &mut *dozer_veh;
             let mut pos_mut = dozer_xy;
             let mut vel_mut = Vec2::new(veh.vx, veh.vy);
@@ -319,7 +320,7 @@ pub fn evaluate_dozer_structural_impacts_system(
                 &mut veh.last_impact,
                 recoil_dir,
                 0.0,
-                0.12,
+                recoil_bounce,
             );
             veh.vx = vel_mut.x;
             veh.vy = vel_mut.y;
@@ -1045,6 +1046,24 @@ mod tests {
         assert_eq!(prog.next_milestone_cash, 900);
         assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Paused);
 
+        // Verify Escape cannot bypass a pending Campaign upgrade choice while paused
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Escape);
+        for _ in 0..3 {
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+        }
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Paused);
+        assert_eq!(
+            app.world()
+                .resource::<pd_dozer::UpgradeProgression>()
+                .pending_upgrade_choices,
+            1
+        );
+
         // 2. Press '1' (AR400 Edge) to select the upgrade and resume Playing.
         app.world_mut()
             .resource_mut::<ButtonInput<KeyCode>>()
@@ -1087,6 +1106,53 @@ mod tests {
         }
         let scars_after = app.world().resource::<GroundDecalPool>().total_crushed_scars;
         assert!(scars_after > initial_scars);
+
+        // 4. Verify selecting an upgrade while paused in Sandbox mode preserves AppState::Paused
+        app.world_mut().resource_mut::<EnvironmentConfig>().mode = pd_core::GameMode::Sandbox;
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Paused);
+        for _ in 0..2 {
+            app.update();
+        }
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Paused);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit3);
+        for _ in 0..3 {
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+        }
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Paused);
+        assert!(
+            (app.world().resource::<UpgradeMultipliers>().aux_ram - 1.35).abs() < 1e-5
+        );
+
+        // 5. Verify keyboard Enter in NewGameModal resets upgrades to 1.0x even when level changes
+        app.world_mut().resource_mut::<EnvironmentConfig>().mode = pd_core::GameMode::Campaign;
+        app.world_mut().resource_mut::<EnvironmentConfig>().level = pd_core::CampaignLevel::Village2;
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::NewGameModal);
+        for _ in 0..2 {
+            app.update();
+        }
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Enter);
+        for _ in 0..3 {
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+        }
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Playing);
+        let reset_upgrades = *app.world().resource::<UpgradeMultipliers>();
+        assert!((reset_upgrades.ar400_edge - 1.0).abs() < 1e-5);
+        assert!((reset_upgrades.charge_air_kit - 1.0).abs() < 1e-5);
+        assert!((reset_upgrades.aux_ram - 1.0).abs() < 1e-5);
     }
 }
 
