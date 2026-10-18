@@ -18,7 +18,10 @@ use pd_destruction::{
     ModularBuilding, NodeIndex, PdDestructionPlugin, PropArchetype, build_building_iso_assembly,
     queue_structural_integrity_evaluation, spawn_pooled_debris_chunk,
 };
-use pd_dozer::{BladeState, PdDozerPlugin, PlayerVehicle, TrackInput, UpgradeMultipliers};
+use pd_dozer::{
+    BladeState, PdDozerPlugin, PlayerVehicle, TrackInput, UpgradeMultipliers, apply_dozer_impulse,
+    compute_blade_contact_points,
+};
 use pd_ui::PdUiPlugin;
 use pd_world::{CutawayFootprint, PdWorldPlugin};
 
@@ -222,7 +225,7 @@ pub fn evaluate_dozer_structural_impacts_system(
     mut particle_events: EventWriter<ParticleBurstEvent>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
     mut destroyed_ids: Local<Vec<NodeIndex>>,
-    dozer_query: Query<(Option<&WorldPose>, &Transform), With<PlayerVehicle>>,
+    mut dozer_query: Query<(&mut PlayerVehicle, Option<&WorldPose>, &Transform), With<PlayerVehicle>>,
     mut building_query: Query<
         (
             Entity,
@@ -248,13 +251,24 @@ pub fn evaluate_dozer_structural_impacts_system(
         ),
     >,
 ) {
-    let Ok((dozer_pose, dozer_tf)) = dozer_query.get_single() else {
+    let Ok((mut dozer_veh, dozer_pose, dozer_tf)) = dozer_query.get_single_mut() else {
         return;
     };
     let dozer_xy = dozer_pose.map_or_else(
         || sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO),
         |p| sanitize_vec2(p.pos, Vec2::ZERO),
     );
+    let dozer_heading = dozer_pose.map_or_else(
+        || sanitize_f32(dozer_tf.rotation.to_euler(EulerRot::ZYX).0, 0.0),
+        |p| sanitize_f32(p.heading_rad, 0.0),
+    );
+    let blade_down = *blade_state == BladeState::BladeDown;
+    let blade_points = compute_blade_contact_points(dozer_xy, dozer_heading, blade_down);
+    let slam_bonus = if dozer_veh.blade_landed_this_tick {
+        10.0
+    } else {
+        0.0
+    };
     let task_pool = AsyncComputeTaskPool::get();
 
     let max_nodes_per_hit: usize = match *blade_state {
@@ -264,13 +278,17 @@ pub fn evaluate_dozer_structural_impacts_system(
 
     let mut contact_load = 0.0_f32;
 
-    // 1. Evaluate building structural impacts
+    // 1. Evaluate building structural impacts via 5-point blade contact array & hull footprint
     for (b_entity, b_pose, b_tf, b_meta, mut cutaway, base_box, assembly) in &mut building_query {
         let b_xy = b_pose.map_or_else(
             || sanitize_vec2(b_tf.translation.truncate(), Vec2::ZERO),
             |p| sanitize_vec2(p.pos, Vec2::ZERO),
         );
-        if dozer_xy.distance_squared(b_xy) > 95.0 * 95.0 {
+        let b_hit_radius = 85.0 + slam_bonus;
+        let blade_hit = blade_points
+            .iter()
+            .any(|pt| pt.distance_squared(b_xy) <= b_hit_radius * b_hit_radius);
+        if !blade_hit && dozer_xy.distance_squared(b_xy) > 95.0 * 95.0 {
             continue;
         }
 
@@ -288,6 +306,23 @@ pub fn evaluate_dozer_structural_impacts_system(
 
         if !destroyed_ids.is_empty() {
             contact_load += 1.5;
+            let recoil_dir = (dozer_xy - b_xy).normalize_or_zero();
+            let veh = &mut *dozer_veh;
+            let mut pos_mut = dozer_xy;
+            let mut vel_mut = Vec2::new(veh.vx, veh.vy);
+            let _ = apply_dozer_impulse(
+                &mut pos_mut,
+                &mut vel_mut,
+                dozer_heading,
+                &mut veh.pitch,
+                &mut veh.roll,
+                &mut veh.last_impact,
+                recoil_dir,
+                0.0,
+                0.12,
+            );
+            veh.vx = vel_mut.x;
+            veh.vy = vel_mut.y;
             cutaway.exterior_breached = true;
             audio_events.send(AudioTriggerEvent {
                 kind: AudioSfxKind::StructuralCrunch,
@@ -355,8 +390,28 @@ pub fn evaluate_dozer_structural_impacts_system(
             || sanitize_vec2(prop_tf.translation.truncate(), Vec2::ZERO),
             |p| sanitize_vec2(p.pos, Vec2::ZERO),
         );
-        if dozer_xy.distance_squared(p_xy) <= 42.0 * 42.0 {
+        let p_hit_radius = 32.0 + slam_bonus;
+        let blade_hit = blade_points
+            .iter()
+            .any(|pt| pt.distance_squared(p_xy) <= p_hit_radius * p_hit_radius);
+        if blade_hit || dozer_xy.distance_squared(p_xy) <= 42.0 * 42.0 {
             contact_load += 0.35;
+            let veh = &mut *dozer_veh;
+            let mut pos_mut = dozer_xy;
+            let mut vel_mut = Vec2::new(veh.vx, veh.vy);
+            let _ = apply_dozer_impulse(
+                &mut pos_mut,
+                &mut vel_mut,
+                dozer_heading,
+                &mut veh.pitch,
+                &mut veh.roll,
+                &mut veh.last_impact,
+                (dozer_xy - p_xy).normalize_or_zero(),
+                0.0,
+                0.08,
+            );
+            veh.vx = vel_mut.x;
+            veh.vy = vel_mut.y;
             let p_screen = world_to_iso_screen(p_xy, 4.0);
             cash_events.send(DemolitionCashEvent {
                 amount: prop.archetype.cash_value(),
@@ -410,7 +465,8 @@ pub fn evaluate_dozer_structural_impacts_system(
 
     // 3. Tier 2 -> Tier 3 Heightmap Crushing: Driving over sleeping rubble with BladeDown
     // flattens the rubble into the persistent ground decal layer.
-    if *blade_state == BladeState::BladeDown {
+    if blade_down {
+        let r_hit_radius = 30.0 + slam_bonus;
         for (rubble_entity, rubble_pose, rubble_tf, mut chunk) in &mut sleeping_rubble_query {
             if chunk.tier != DebrisTier::SleepingInstanced {
                 continue;
@@ -419,7 +475,10 @@ pub fn evaluate_dozer_structural_impacts_system(
                 || sanitize_vec2(rubble_tf.translation.truncate(), Vec2::ZERO),
                 |p| sanitize_vec2(p.pos, Vec2::ZERO),
             );
-            if dozer_xy.distance_squared(r_xy) <= 38.0 * 38.0 {
+            let blade_hit = blade_points
+                .iter()
+                .any(|pt| pt.distance_squared(r_xy) <= r_hit_radius * r_hit_radius);
+            if blade_hit || dozer_xy.distance_squared(r_xy) <= 38.0 * 38.0 {
                 chunk.tier = DebrisTier::CrushedDecal;
                 debris_pool.active_ring.retain(|&e| e != rubble_entity);
                 decal_events.send(DecalSpawnRequest {
@@ -521,6 +580,7 @@ mod tests {
             external_load_factor: 999.0,
             penetration_depth: 2.0,
             contact_normal: Vec2::new(f32::NAN, f32::INFINITY),
+            ..Default::default()
         };
 
         // 1. dt == 0.0 -> clean Err
@@ -925,6 +985,110 @@ mod tests {
             .count();
         assert!(extruded_mesh_count >= 25);
     }
+
+    /// Epic #2 Verification Test: Verifies timed powered blade surge & 5-point blade contact (#11),
+    /// heavy machinery momentum, turn scrub & spring-damper chassis pitch/roll (#12), and
+    /// milestone upgrade choices (`1`/`2`/`3`) with Campaign modal pause & level retry reset (#13).
+    #[test]
+    fn test_epic_2_blade_points_timed_push_momentum_and_milestone_upgrades() {
+        let _task_pool = AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().build());
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            StatesPlugin,
+            TransformPlugin,
+            HierarchyPlugin,
+        ))
+        .init_asset::<Image>()
+        .init_asset::<TextureAtlasLayout>()
+        .init_asset::<Mesh>()
+        .init_asset::<ColorMaterial>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_plugins((
+            PdCorePlugin,
+            PdWorldPlugin,
+            PdDozerPlugin,
+            PdDestructionPlugin,
+            PdAiPlugin,
+            PdUiPlugin,
+        ))
+        .add_systems(
+            Update,
+            evaluate_dozer_structural_impacts_system.after(PdSystemSet::WorldTilemapSync),
+        );
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        for _ in 0..3 {
+            app.update();
+        }
+
+        // 1. Verify reaching $350 in Campaign mode does NOT passively auto-scale UpgradeMultipliers,
+        //    and instead queues a pending upgrade choice and pauses the simulation.
+        app.world_mut().send_event(DemolitionCashEvent {
+            amount: 400,
+            world_pos: Vec3::ZERO,
+        });
+        for _ in 0..3 {
+            app.update();
+        }
+
+        let upgrades = *app.world().resource::<UpgradeMultipliers>();
+        assert!((upgrades.ar400_edge - 1.0).abs() < 1e-5);
+        assert!((upgrades.charge_air_kit - 1.0).abs() < 1e-5);
+        assert!((upgrades.aux_ram - 1.0).abs() < 1e-5);
+        let prog = app.world().resource::<pd_dozer::UpgradeProgression>();
+        assert_eq!(prog.pending_upgrade_choices, 1);
+        assert_eq!(prog.next_milestone_cash, 900);
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Paused);
+
+        // 2. Press '1' (AR400 Edge) to select the upgrade and resume Playing.
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::Digit1);
+        for _ in 0..3 {
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<KeyCode>>()
+                .clear();
+        }
+
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Playing);
+        let upgrades_after = *app.world().resource::<UpgradeMultipliers>();
+        assert!((upgrades_after.ar400_edge - 1.42).abs() < 1e-5);
+
+        // 3. Verify 5-point blade contact crushes rubble located ahead of the dozer center (+26.4 world units)
+        *app.world_mut().resource_mut::<BladeState>() = BladeState::BladeDown;
+        let epoch = *app.world().resource::<SessionEpoch>();
+        let initial_scars = app.world().resource::<GroundDecalPool>().total_crushed_scars;
+        // Dozer spawns at (0.0, -60.0) with yaw = 0.0 (+X forward); front blade center is at (26.4, -60.0).
+        // Put sleeping rubble at (52.0, -60.0): distance from dozer center is 52.0 (> 38.0 hull radius),
+        // but distance from front blade point (26.4, -60.0) is 25.6 (<= 30.0 blade hit radius)!
+        app.world_mut().spawn((
+            SiteScoped { epoch },
+            DebrisTier::SleepingInstanced,
+            DebrisChunk {
+                tier: DebrisTier::SleepingInstanced,
+                active_timer_secs: 0.0,
+                simulated_z_height: 0.0,
+                vertical_z_velocity: 0.0,
+                horizontal_velocity: Vec2::ZERO,
+                spin_rate: 0.0,
+            },
+            WorldPose::from_xy(52.0, -60.0),
+            Transform::from_xyz(52.0, -60.0, 0.0),
+            GlobalTransform::default(),
+        ));
+        for _ in 0..3 {
+            app.update();
+        }
+        let scars_after = app.world().resource::<GroundDecalPool>().total_crushed_scars;
+        assert!(scars_after > initial_scars);
+    }
 }
+
 
 

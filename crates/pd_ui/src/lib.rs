@@ -3,17 +3,19 @@
 //! corner flathead screws `⊖`, gold top trim, analog `ENGINE HEAT` & `TRACK STRESS` dial gauges,
 //! `AR400 Edge` / `Charge-Air Kit` / `Aux Ram` bezel, and `BLADE UP`/`BLADE DOWN` LED) plus
 //! interactive Title Screen ("COUNTY BUILDING DEPARTMENT - APPLICATION FOR DEMOLITION"), Pause,
-//! and New Game modals.
+//! Upgrade Selection (`1`/`2`/`3`), and New Game modals.
 //!
 //! Depends only on `pd_core` and `pd_dozer`.
 
 use bevy::prelude::*;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, CashLedger, CashPopupPool, DebugTelemetry,
-    ElapsedClock, EnvironmentConfig, MAX_CASH_POPUPS, MAX_ODOMETER_CASH, PdSystemSet,
+    ElapsedClock, EnvironmentConfig, GameMode, MAX_CASH_POPUPS, MAX_ODOMETER_CASH, PdSystemSet,
     SessionEpoch, SiteRestartRequested, sanitize_f32,
 };
-use pd_dozer::{BladeState, MechanicalStress, UpgradeMultipliers};
+use pd_dozer::{
+    BladeState, MechanicalStress, UpgradeChoice, UpgradeMultipliers, UpgradeProgression,
+};
 use serde::{Deserialize, Serialize};
 
 /// Marker component for the root UI canvas spawned at startup.
@@ -58,6 +60,10 @@ pub struct TitleScreenModalNode;
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct PauseModalNode;
 
+/// Marker component for the interactive Milestone Upgrade Selection Modal container (`Issue #13`).
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct UpgradeSelectionModalNode;
+
 /// Marker component for the New Game configuration modal container.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct NewGameModalNode;
@@ -97,6 +103,9 @@ pub enum HudButtonAction {
     ToggleSoundMute,
     ShowAboutInfo,
     ShowSocialInfo,
+    SelectUpgradeAr400Edge,
+    SelectUpgradeChargeAirKit,
+    SelectUpgradeAuxRam,
 }
 
 /// Computes a finite analog dial needle rotation angle (radians) for a `0%..=100%` gauge reading.
@@ -165,7 +174,7 @@ fn spawn_beveled_button(
 }
 
 /// Spawns the industrial Top Header Bar, Bottom Cab Dashboard HUD, Floating Cash Popup layer,
-/// Debug overlay, and Title / Pause / New Game modals if not already present.
+/// Debug overlay, and Title / Pause / Upgrade Selection / New Game modals if not already present.
 pub fn ensure_industrial_hud_spawned_system(
     mut commands: Commands,
     existing_root: Query<Entity, With<IndustrialHudRoot>>,
@@ -403,7 +412,7 @@ pub fn ensure_industrial_hud_spawned_system(
                             form.spawn((
                                 ModalSubInfoBannerText,
                                 Text::new(
-                                    "WASD/Arrows: Skid-Steer | Space/Shift: Blade Up/Down | B: Restart Site",
+                                    "WASD/Arrows: Drive | Space/Shift: Powered Blade Push | 1/2/3: Upgrade | B: Restart",
                                 ),
                                 TextColor(Color::srgb(0.25, 0.24, 0.22)),
                             ));
@@ -466,6 +475,54 @@ pub fn ensure_industrial_hud_spawned_system(
                                 HudButtonAction::ReturnToMainMenu,
                                 Color::srgb(0.24, 0.26, 0.30),
                                 Color::srgb(0.94, 0.56, 0.52),
+                            );
+                        });
+
+                    // -----------------------------------------------------------------
+                    // Modal B2: Milestone Upgrade Selection Modal (`1`/`2`/`3` Choice)
+                    // -----------------------------------------------------------------
+                    center
+                        .spawn((
+                            Name::new("Equipment Upgrade Selection Modal"),
+                            UpgradeSelectionModalNode,
+                            Node {
+                                width: Val::Px(520.0),
+                                padding: UiRect::all(Val::Px(20.0)),
+                                border: UiRect::all(Val::Px(2.0)),
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::Center,
+                                row_gap: Val::Px(8.0),
+                                display: Display::None,
+                                ..Default::default()
+                            },
+                            BackgroundColor(Color::srgb(0.15, 0.16, 0.18)),
+                            BorderColor(Color::srgb(0.94, 0.76, 0.22)),
+                        ))
+                        .with_children(|up_modal| {
+                            up_modal.spawn((
+                                Text::new("EQUIPMENT UPGRADE MILESTONE — CHOOSE AN UPGRADE"),
+                                TextColor(Color::srgb(0.96, 0.80, 0.24)),
+                            ));
+                            spawn_beveled_button(
+                                up_modal,
+                                UpgradeChoice::Ar400Edge.label(),
+                                HudButtonAction::SelectUpgradeAr400Edge,
+                                Color::srgb(0.24, 0.28, 0.32),
+                                Color::srgb(0.98, 0.86, 0.32),
+                            );
+                            spawn_beveled_button(
+                                up_modal,
+                                UpgradeChoice::ChargeAirKit.label(),
+                                HudButtonAction::SelectUpgradeChargeAirKit,
+                                Color::srgb(0.24, 0.28, 0.32),
+                                Color::srgb(0.98, 0.86, 0.32),
+                            );
+                            spawn_beveled_button(
+                                up_modal,
+                                UpgradeChoice::AuxRam.label(),
+                                HudButtonAction::SelectUpgradeAuxRam,
+                                Color::srgb(0.24, 0.28, 0.32),
+                                Color::srgb(0.98, 0.86, 0.32),
                             );
                         });
 
@@ -608,11 +665,14 @@ pub fn ensure_industrial_hud_spawned_system(
 }
 
 /// Handles mouse clicks on all beveled HUD and Modal buttons (`HudButtonAction`).
+#[allow(clippy::too_many_arguments)]
 pub fn handle_hud_button_interactions_system(
     interactions: Query<(&Interaction, &HudButtonAction), Changed<Interaction>>,
     mut next_state: ResMut<NextState<AppState>>,
     app_state: Res<State<AppState>>,
     mut env_config: ResMut<EnvironmentConfig>,
+    mut upgrades: ResMut<UpgradeMultipliers>,
+    mut progression: ResMut<UpgradeProgression>,
     mut telemetry: ResMut<DebugTelemetry>,
     mut restart_writer: EventWriter<SiteRestartRequested>,
     mut audio_writer: EventWriter<AudioTriggerEvent>,
@@ -628,6 +688,7 @@ pub fn handle_hud_button_interactions_system(
 
         match *action {
             HudButtonAction::PlayFromTitle | HudButtonAction::StartConfiguredGame => {
+                progression.reset_new_game(&mut upgrades, env_config.level);
                 next_state.set(AppState::Playing);
                 restart_writer.send(SiteRestartRequested {
                     preserve_layout: false,
@@ -658,8 +719,8 @@ pub fn handle_hud_button_interactions_system(
             }
             HudButtonAction::CycleGameMode => {
                 env_config.mode = match env_config.mode {
-                    pd_core::GameMode::Campaign => pd_core::GameMode::Sandbox,
-                    pd_core::GameMode::Sandbox => pd_core::GameMode::Campaign,
+                    GameMode::Campaign => GameMode::Sandbox,
+                    GameMode::Sandbox => GameMode::Campaign,
                 };
             }
             HudButtonAction::CycleCampaignLevel => {
@@ -673,7 +734,7 @@ pub fn handle_hud_button_interactions_system(
             }
             HudButtonAction::ShowControlsInfo => {
                 telemetry.info_banner = Some(
-                    "WASD/Arrows: Skid-Steer | Q/Z & E/C: Dual Tracks | Space/Shift: Blade Up/Down | B: Restart".to_string(),
+                    "WASD/Arrows: Skid-Steer | Space/Shift: Powered Blade Push | 1/2/3: Upgrade | B: Restart".to_string(),
                 );
             }
             HudButtonAction::ToggleSoundMute => {
@@ -691,21 +752,54 @@ pub fn handle_hud_button_interactions_system(
                     "Columbia Cloudworks LLC Municipal Demolition Division — Permit #000-DENIED".to_string(),
                 );
             }
+            HudButtonAction::SelectUpgradeAr400Edge => {
+                if progression.try_apply_choice(
+                    &mut upgrades,
+                    env_config.mode,
+                    UpgradeChoice::Ar400Edge,
+                ) && progression.pending_upgrade_choices == 0
+                {
+                    next_state.set(AppState::Playing);
+                }
+            }
+            HudButtonAction::SelectUpgradeChargeAirKit => {
+                if progression.try_apply_choice(
+                    &mut upgrades,
+                    env_config.mode,
+                    UpgradeChoice::ChargeAirKit,
+                ) && progression.pending_upgrade_choices == 0
+                {
+                    next_state.set(AppState::Playing);
+                }
+            }
+            HudButtonAction::SelectUpgradeAuxRam => {
+                if progression.try_apply_choice(
+                    &mut upgrades,
+                    env_config.mode,
+                    UpgradeChoice::AuxRam,
+                ) && progression.pending_upgrade_choices == 0
+                {
+                    next_state.set(AppState::Playing);
+                }
+            }
         }
     }
 }
 
-/// Synchronizes modal visibility (`TitleScreenModalNode`, `PauseModalNode`, `NewGameModalNode`)
-/// with `AppState`.
+/// Synchronizes modal visibility (`TitleScreenModalNode`, `PauseModalNode`,
+/// `UpgradeSelectionModalNode`, `NewGameModalNode`) with `AppState` and `UpgradeProgression`.
+#[allow(clippy::type_complexity)]
 pub fn sync_modal_visibility_system(
     app_state: Res<State<AppState>>,
     env_config: Res<EnvironmentConfig>,
+    progression: Res<UpgradeProgression>,
     telemetry: Res<DebugTelemetry>,
     mut title_q: Query<
         &mut Node,
         (
             With<TitleScreenModalNode>,
             Without<PauseModalNode>,
+            Without<UpgradeSelectionModalNode>,
             Without<NewGameModalNode>,
         ),
     >,
@@ -714,6 +808,16 @@ pub fn sync_modal_visibility_system(
         (
             With<PauseModalNode>,
             Without<TitleScreenModalNode>,
+            Without<UpgradeSelectionModalNode>,
+            Without<NewGameModalNode>,
+        ),
+    >,
+    mut upgrade_q: Query<
+        &mut Node,
+        (
+            With<UpgradeSelectionModalNode>,
+            Without<TitleScreenModalNode>,
+            Without<PauseModalNode>,
             Without<NewGameModalNode>,
         ),
     >,
@@ -723,6 +827,7 @@ pub fn sync_modal_visibility_system(
             With<NewGameModalNode>,
             Without<TitleScreenModalNode>,
             Without<PauseModalNode>,
+            Without<UpgradeSelectionModalNode>,
         ),
     >,
     mut config_text_q: Query<
@@ -741,6 +846,10 @@ pub fn sync_modal_visibility_system(
     >,
 ) {
     let state = *app_state.get();
+    let show_upgrade_modal = state == AppState::Paused
+        && env_config.mode == GameMode::Campaign
+        && progression.pending_upgrade_choices > 0;
+
     if let Ok(mut node) = title_q.get_single_mut() {
         node.display = if state == AppState::Title {
             Display::Flex
@@ -749,7 +858,14 @@ pub fn sync_modal_visibility_system(
         };
     }
     if let Ok(mut node) = pause_q.get_single_mut() {
-        node.display = if state == AppState::Paused {
+        node.display = if state == AppState::Paused && !show_upgrade_modal {
+            Display::Flex
+        } else {
+            Display::None
+        };
+    }
+    if let Ok(mut node) = upgrade_q.get_single_mut() {
+        node.display = if show_upgrade_modal {
             Display::Flex
         } else {
             Display::None
@@ -782,6 +898,7 @@ pub fn sync_modal_visibility_system(
 
 /// Updates the Top/Bottom HUD readouts (6-digit rolling odometer reels, `MM:SS` clock, analog gauge
 /// needles, upgrade multipliers, blade LED status, floating cash popups, and debug telemetry).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn update_industrial_hud_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     app_state: Res<State<AppState>>,
@@ -793,6 +910,7 @@ pub fn update_industrial_hud_system(
     clock: Res<ElapsedClock>,
     blade_state: Res<BladeState>,
     upgrades: Res<UpgradeMultipliers>,
+    progression: Res<UpgradeProgression>,
     stress: Res<MechanicalStress>,
     mut telemetry: ResMut<DebugTelemetry>,
     mut restart_writer: EventWriter<SiteRestartRequested>,
@@ -885,10 +1003,17 @@ pub fn update_industrial_hud_system(
         } else if is_stress {
             text.0 = format!("TRACK STRESS [{track_glyph}] {:03.0}%", track_pct);
         } else if is_upgrade {
-            text.0 = format!(
-                "AR400 Edge {:.2}x | Charge-Air Kit {:.2}x | Aux Ram {:.2}x",
-                safe_up.ar400_edge, safe_up.charge_air_kit, safe_up.aux_ram
-            );
+            if progression.pending_upgrade_choices > 0 {
+                text.0 = format!(
+                    "[1] AR400 {:.2}x | [2] Charge-Air {:.2}x | [3] Aux Ram {:.2}x (PICK UPGRADE!)",
+                    safe_up.ar400_edge, safe_up.charge_air_kit, safe_up.aux_ram
+                );
+            } else {
+                text.0 = format!(
+                    "AR400 Edge {:.2}x | Charge-Air Kit {:.2}x | Aux Ram {:.2}x",
+                    safe_up.ar400_edge, safe_up.charge_air_kit, safe_up.aux_ram
+                );
+            }
         } else if is_blade {
             text.0 = format!("● {} ⊖", blade_state.label());
             if let Some(mut color) = maybe_color {
