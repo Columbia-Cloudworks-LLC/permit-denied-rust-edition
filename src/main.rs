@@ -276,6 +276,8 @@ pub fn evaluate_dozer_structural_impacts_system(
     let task_pool = AsyncComputeTaskPool::get();
 
     let mut contact_load = 0.0_f32;
+    let mut max_penetration_meters = 0.0_f32;
+    let mut deepest_contact_normal = Vec2::Y;
 
     // 1. Evaluate building structural impacts via 5-point blade contact array & hull footprint
     for (b_entity, b_pose, b_tf, b_meta, mut cutaway, base_box, assembly) in &mut building_query {
@@ -284,10 +286,13 @@ pub fn evaluate_dozer_structural_impacts_system(
             |p| sanitize_vec2(p.pos, Vec2::ZERO),
         );
         let b_hit_radius = 85.0 + slam_bonus;
-        let blade_hit = blade_points
+        let min_blade_dist = blade_points
             .iter()
-            .any(|pt| pt.distance_squared(b_xy) <= b_hit_radius * b_hit_radius);
-        if !blade_hit && dozer_xy.distance_squared(b_xy) > 95.0 * 95.0 {
+            .map(|pt| pt.distance(b_xy))
+            .fold(f32::INFINITY, f32::min);
+        let blade_hit = min_blade_dist <= b_hit_radius;
+        let hull_dist = dozer_xy.distance(b_xy);
+        if !blade_hit && hull_dist > 95.0 {
             continue;
         }
 
@@ -295,7 +300,30 @@ pub fn evaluate_dozer_structural_impacts_system(
         if let Some(entry) = graph_registry.buildings.get(&b_entity)
             && entry.nodes.values().any(|n| n.intact && n.story_level == 0)
         {
-            let max_nodes_per_hit = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
+            let hull_overlap = (95.0 - hull_dist).max(0.0);
+            let blade_overlap = if min_blade_dist.is_finite() {
+                (b_hit_radius - min_blade_dist).max(0.0)
+            } else {
+                0.0
+            };
+            let overlap_meters =
+                hull_overlap.max(blade_overlap) / pd_dozer::WORLD_UNITS_PER_METER;
+            if overlap_meters > max_penetration_meters {
+                let raw_dir = sanitize_vec2((dozer_xy - b_xy).normalize_or_zero(), Vec2::Y);
+                max_penetration_meters = overlap_meters;
+                deepest_contact_normal = if raw_dir.length_squared() > 1e-4 {
+                    raw_dir
+                } else {
+                    Vec2::Y
+                };
+            }
+
+            let base_nodes = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
+            let max_nodes_per_hit = if dozer_veh.crush_intersecting_block {
+                base_nodes.saturating_add(4)
+            } else {
+                base_nodes
+            };
             for (&id, node) in &entry.nodes {
                 if node.intact && node.story_level == 0 {
                     destroyed_ids.push(id);
@@ -498,7 +526,12 @@ pub fn evaluate_dozer_structural_impacts_system(
         }
     }
 
+    dozer_veh.crush_intersecting_block = false;
     track_input.external_load_factor = contact_load.clamp(0.0, 5.0);
+    if max_penetration_meters > track_input.penetration_depth {
+        track_input.penetration_depth = max_penetration_meters;
+        track_input.contact_normal = deepest_contact_normal;
+    }
 }
 
 fn main() {

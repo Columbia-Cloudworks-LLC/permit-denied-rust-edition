@@ -141,6 +141,7 @@ pub struct PlayerVehicle {
     pub blade_shear_multiplier: f32,
     pub pushing_force_multiplier: f32,
     pub blade_shear_carry: f32,
+    pub crush_intersecting_block: bool,
     pub distance_since_last_tread_decal: f32,
     pub exhaust_smoke_timer: f32,
 }
@@ -1275,6 +1276,7 @@ pub fn evaluate_upgrade_milestones_and_hotkeys_system(
 pub fn fixed_dozer_kinematics_system(
     time: Res<Time>,
     env_config: Res<EnvironmentConfig>,
+    collisions: Option<Res<Collisions>>,
     mut popup_pool: ResMut<CashPopupPool>,
     mut track_input: ResMut<TrackInput>,
     mut blade_state: ResMut<BladeState>,
@@ -1283,6 +1285,7 @@ pub fn fixed_dozer_kinematics_system(
     mut decal_writer: EventWriter<DecalSpawnRequest>,
     mut particle_writer: EventWriter<ParticleBurstEvent>,
     mut dozer_query: Query<(
+        Entity,
         &mut PlayerVehicle,
         &mut WorldPose,
         &mut IsoExtrudedBox,
@@ -1300,6 +1303,7 @@ pub fn fixed_dozer_kinematics_system(
     stress.sandbox_mode = env_config.mode == GameMode::Sandbox;
 
     let Ok((
+        dozer_entity,
         mut vehicle,
         mut pose,
         mut base_box,
@@ -1313,9 +1317,23 @@ pub fn fixed_dozer_kinematics_system(
         return;
     };
 
-    // 1. Feed any Cartesian physics solver corrections back into WorldPose before stepping
+    // 1. Feed any Cartesian physics solver corrections and Avian2D contact manifolds
+    //    back into WorldPose and TrackInput before stepping kinematics & watchdog.
+    let mut detected_penetration_meters = sanitize_f32(track_input.penetration_depth, 0.0).max(0.0);
+    let mut detected_contact_normal = sanitize_vec2(track_input.contact_normal, Vec2::Y);
+
     if let Some(pos_comp) = phys_pos.as_deref() {
-        pose.pos = sanitize_vec2(pos_comp.0, pose.pos);
+        let solved_pos = sanitize_vec2(pos_comp.0, pose.pos);
+        let solver_delta = solved_pos - sanitize_vec2(pose.pos, Vec2::ZERO);
+        let delta_len = sanitize_f32(solver_delta.length(), 0.0);
+        if delta_len > 1e-4 {
+            let solver_pen_meters = delta_len / WORLD_UNITS_PER_METER;
+            if solver_pen_meters > detected_penetration_meters {
+                detected_penetration_meters = solver_pen_meters;
+                detected_contact_normal = sanitize_vec2(solver_delta / delta_len, Vec2::Y);
+            }
+        }
+        pose.pos = solved_pos;
     }
     if let Some(rot_comp) = phys_rot.as_deref() {
         let solved_heading = sanitize_f32(rot_comp.as_radians(), vehicle.heading_radians);
@@ -1323,10 +1341,41 @@ pub fn fixed_dozer_kinematics_system(
         pose.heading_rad = solved_heading;
     }
 
-    // Synchronize persistent vehicle state into TrackInput
+    if let Some(collisions) = collisions.as_deref() {
+        let dozer_rot = Rotation::radians(vehicle.heading_radians);
+        for contacts in collisions.collisions_with_entity(dozer_entity) {
+            if contacts.is_sensor {
+                continue;
+            }
+            for manifold in &contacts.manifolds {
+                if let Some(deepest) = manifold.find_deepest_contact() {
+                    let pen_meters =
+                        sanitize_f32(deepest.penetration / WORLD_UNITS_PER_METER, 0.0).max(0.0);
+                    if pen_meters > detected_penetration_meters {
+                        let raw_normal = if contacts.entity1 == dozer_entity {
+                            -manifold.global_normal1(&dozer_rot)
+                        } else {
+                            -manifold.global_normal2(&dozer_rot)
+                        };
+                        let safe_normal = sanitize_vec2(raw_normal, Vec2::Y).normalize_or_zero();
+                        detected_penetration_meters = pen_meters;
+                        detected_contact_normal = if safe_normal.length_squared() > 1e-4 {
+                            safe_normal
+                        } else {
+                            Vec2::Y
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    // Synchronize persistent vehicle state and contact telemetry into TrackInput
     track_input.heading_radians = vehicle.heading_radians;
     track_input.vx = vehicle.vx;
     track_input.vy = vehicle.vy;
+    track_input.penetration_depth = detected_penetration_meters;
+    track_input.contact_normal = detected_contact_normal;
     track_input.push_timer_secs = vehicle.push_timer_secs;
     track_input.push_cooldown_secs = vehicle.push_cooldown_secs;
     track_input.pitch = vehicle.pitch;
@@ -1370,9 +1419,12 @@ pub fn fixed_dozer_kinematics_system(
     vehicle.odometer_dist = output.odometer_dist;
     vehicle.blade_shear_multiplier = output.blade_shear_multiplier;
     vehicle.pushing_force_multiplier = output.pushing_force_multiplier;
+    vehicle.crush_intersecting_block = output.crush_intersecting_block;
 
     track_input.vx = output.linear_velocity.x;
     track_input.vy = output.linear_velocity.y;
+    track_input.penetration_depth = 0.0;
+    track_input.contact_normal = Vec2::Y;
     track_input.blade_down = output.blade_state == BladeState::BladeDown;
     track_input.push_timer_secs = output.push_timer_secs;
     track_input.push_cooldown_secs = output.push_cooldown_secs;
@@ -1457,7 +1509,7 @@ pub fn fixed_dozer_kinematics_system(
     }
 
     if let Some(disp) = output.depenetration_displacement {
-        let safe_disp = sanitize_vec2(disp, Vec2::ZERO);
+        let safe_disp = sanitize_vec2(disp, Vec2::ZERO) * WORLD_UNITS_PER_METER;
         pose.pos = sanitize_vec2(pose.pos + safe_disp, pose.pos);
     }
 
@@ -2046,6 +2098,59 @@ mod tests {
                 triggered.first().map(|e| e.kind),
                 Some(AudioSfxKind::BladeHydraulicHiss)
             );
+        }
+    }
+
+    #[test]
+    fn test_fixed_dozer_kinematics_system_feeds_solver_penetration_into_watchdog() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins);
+        app.init_resource::<SessionEpoch>()
+            .init_resource::<EnvironmentConfig>()
+            .init_resource::<CashPopupPool>()
+            .init_resource::<BladeState>()
+            .init_resource::<UpgradeMultipliers>()
+            .init_resource::<MechanicalStress>()
+            .init_resource::<TrackInput>()
+            .add_event::<DecalSpawnRequest>()
+            .add_event::<ParticleBurstEvent>()
+            .add_systems(
+                Update,
+                (
+                    ensure_player_dozer_spawned_system,
+                    fixed_dozer_kinematics_system,
+                )
+                    .chain(),
+            );
+
+        app.update();
+
+        for tick in 1..=4 {
+            app.world_mut()
+                .resource_mut::<Time>()
+                .advance_by(std::time::Duration::from_millis(16));
+            // Simulate a 0.5m (8.0 world units) solver depenetration push along +X before the tick
+            {
+                let mut q = app
+                    .world_mut()
+                    .query::<(&WorldPose, &mut Position, &PlayerVehicle)>();
+                for (pose, mut pos, _) in q.iter_mut(app.world_mut()) {
+                    pos.0 = pose.pos + Vec2::new(8.0, 0.0);
+                }
+            }
+            app.update();
+
+            let mut q = app.world_mut().query::<(&WorldPose, &PlayerVehicle)>();
+            if let Some((pose, veh)) = q.iter(app.world()).next() {
+                if tick < 4 {
+                    assert!(!veh.crush_intersecting_block);
+                } else {
+                    // On tick 4 (> WEDGED_TICK_THRESHOLD), watchdog triggers crush_intersecting_block
+                    // and adds an extra +0.5m (+8.0 world units) recovery displacement along +X
+                    assert!(veh.crush_intersecting_block);
+                    assert!(pose.pos.x >= 4.0 * 8.0 + 7.9);
+                }
+            }
         }
     }
 }
