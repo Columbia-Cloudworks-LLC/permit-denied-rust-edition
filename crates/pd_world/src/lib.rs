@@ -15,8 +15,8 @@ use bevy::sprite::AlphaMode2d;
 use bevy_ecs_tilemap::prelude::*;
 pub use pd_core::{
     ISO_BIAS_GROUND_BACKDROP, ISO_BIAS_GROUND_DECALS, ISO_BIAS_GROUND_TILES, ISO_BIAS_PARTICLES,
-    IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, RoofSlopeSpec, WorldPose, heading_offset,
-    iso_depth_key, iso_screen_to_world, world_to_iso_screen,
+    IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, MaterialKind, RoofSlopeSpec, WorldPose,
+    heading_offset, iso_depth_key, iso_screen_to_world, world_to_iso_screen,
 };
 use pd_core::{
     AppState, CampaignLevel, DecalKind, DecalSpawnRequest, EnvironmentConfig, ParticleBurstEvent,
@@ -1977,6 +1977,275 @@ impl WorldParticlePool {
     }
 }
 
+/// Persistent collapsed building foundation scar (`CollapsedSite` in `site.ts` / Issue #16).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CollapsedSite {
+    pub footprint_half_extents: Vec2,
+    pub dominant_material: MaterialKind,
+    pub rubble_mass: f32,
+}
+
+/// Single grid cell in the pre-allocated 2D `PileField` height/resistance field (`pile.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PileCell {
+    pub pile_mass: f32,
+    pub height: f32,
+    pub compact: f32,
+    pub material: MaterialKind,
+}
+
+impl Default for PileCell {
+    fn default() -> Self {
+        Self {
+            pile_mass: 0.0,
+            height: 0.0,
+            compact: 0.0,
+            material: MaterialKind::Concrete,
+        }
+    }
+}
+
+/// 3x3 normalized distribution kernel for `PileField::add_mass` (`sum == 1.0`).
+pub const PILE_KERNEL_3X3: [(i32, i32, f32); 9] = [
+    (-1, -1, 0.06),
+    (0, -1, 0.12),
+    (1, -1, 0.06),
+    (-1, 0, 0.12),
+    (0, 0, 0.28),
+    (1, 0, 0.12),
+    (-1, 1, 0.06),
+    (0, 1, 0.12),
+    (1, 1, 0.06),
+];
+
+/// Pre-allocated 2D height, compaction, and resistance field for settled/crushed rubble mass
+/// (`PileField` in `pile.ts` / Issue #16). Zero heap allocations occur after initialization.
+#[derive(Resource, Debug, Clone, Serialize, Deserialize)]
+pub struct PileField {
+    pub cols: usize,
+    pub rows: usize,
+    pub cell_size: f32,
+    pub origin_xy: Vec2,
+    pub cells: Vec<PileCell>,
+}
+
+impl Default for PileField {
+    fn default() -> Self {
+        let cols: usize = 128;
+        let rows: usize = 128;
+        let cell_size: f32 = 16.0;
+        let origin_xy = Vec2::new(-1024.0, -1024.0);
+        Self {
+            cols,
+            rows,
+            cell_size,
+            origin_xy,
+            cells: vec![PileCell::default(); cols.saturating_mul(rows)],
+        }
+    }
+}
+
+impl PileField {
+    /// Resets all cells in-place without reallocating.
+    pub fn clear(&mut self) {
+        for cell in &mut self.cells {
+            *cell = PileCell::default();
+        }
+    }
+
+    /// Converts a world-space 2D coordinate into clamped interior grid indices `(gx, gy)`
+    /// (`[1, cols - 2]`, `[1, rows - 2]`) so 3x3 kernel updates always stay in-bounds and conserve mass.
+    #[must_use]
+    pub fn world_to_interior_cell(&self, world_pos: Vec2) -> (usize, usize) {
+        let safe_pos = sanitize_vec2(world_pos, Vec2::ZERO);
+        let safe_cs = sanitize_f32(self.cell_size, 16.0).max(1.0);
+        let rel = (safe_pos - self.origin_xy) / safe_cs;
+        let max_gx = self.cols.saturating_sub(2).max(1);
+        let max_gy = self.rows.saturating_sub(2).max(1);
+        let gx = (rel.x.floor() as isize).clamp(1, max_gx as isize) as usize;
+        let gy = (rel.y.floor() as isize).clamp(1, max_gy as isize) as usize;
+        (gx, gy)
+    }
+
+    /// Converts a world-space 2D coordinate into grid indices `(gx, gy)` clamped to `[0, cols - 1]`.
+    #[must_use]
+    pub fn world_to_cell(&self, world_pos: Vec2) -> (usize, usize) {
+        let safe_pos = sanitize_vec2(world_pos, Vec2::ZERO);
+        let safe_cs = sanitize_f32(self.cell_size, 16.0).max(1.0);
+        let rel = (safe_pos - self.origin_xy) / safe_cs;
+        let max_gx = self.cols.saturating_sub(1);
+        let max_gy = self.rows.saturating_sub(1);
+        let gx = (rel.x.floor() as isize).clamp(0, max_gx as isize) as usize;
+        let gy = (rel.y.floor() as isize).clamp(0, max_gy as isize) as usize;
+        (gx, gy)
+    }
+
+    #[must_use]
+    pub fn cell_index(&self, gx: usize, gy: usize) -> Option<usize> {
+        if gx < self.cols && gy < self.rows {
+            gy.checked_mul(self.cols)?.checked_add(gx)
+        } else {
+            None
+        }
+    }
+
+    /// Deposits `mass` of `material` at `world_pos` across a 3x3 weighted kernel (`addPileMass` in `pile.ts`),
+    /// strictly conserving total mass (`self.total_mass()` increases by `mass`).
+    pub fn add_mass(&mut self, world_pos: Vec2, mass: f32, material: MaterialKind) {
+        let safe_mass = sanitize_f32(mass, 0.0);
+        if safe_mass <= 0.0 {
+            return;
+        }
+        let (cx, cy) = self.world_to_interior_cell(world_pos);
+        for (dx, dy, weight) in PILE_KERNEL_3X3 {
+            let nx = (cx as i32).saturating_add(dx).max(0) as usize;
+            let ny = (cy as i32).saturating_add(dy).max(0) as usize;
+            if let Some(idx) = self.cell_index(nx, ny)
+                && let Some(cell) = self.cells.get_mut(idx)
+            {
+                let add = safe_mass * weight;
+                cell.pile_mass = sanitize_f32(cell.pile_mass + add, cell.pile_mass);
+                let gain = add * 1.35 * (1.0 - 0.38 * cell.compact).clamp(0.25, 1.0);
+                cell.height = sanitize_f32(cell.height + gain, cell.height).clamp(0.0, 28.0);
+                cell.compact = sanitize_f32(cell.compact - add * 0.08, cell.compact).clamp(0.0, 1.0);
+                if add > 0.04 || cell.pile_mass <= add * 1.5 {
+                    cell.material = material;
+                }
+            }
+        }
+    }
+
+    /// Returns the pile height (`>= 0.0`) at `world_pos` (`pileHeightAt` in `pile.ts`).
+    #[must_use]
+    pub fn height_at(&self, world_pos: Vec2) -> f32 {
+        let (gx, gy) = self.world_to_cell(world_pos);
+        self.cell_index(gx, gy)
+            .and_then(|idx| self.cells.get(idx))
+            .map_or(0.0, |c| sanitize_f32(c.height, 0.0).max(0.0))
+    }
+
+    /// Returns the physical pile drag/resistance (`>= 0.0`) at `world_pos` (`pileResistanceAt` in `pile.ts`).
+    #[must_use]
+    pub fn pile_resistance_at(&self, world_pos: Vec2) -> f32 {
+        let (gx, gy) = self.world_to_cell(world_pos);
+        self.cell_index(gx, gy)
+            .and_then(|idx| self.cells.get(idx))
+            .map_or(0.0, |c| {
+                if c.pile_mass <= 1e-5 && c.height <= 1e-5 {
+                    0.0
+                } else {
+                    let raw = c.height * 0.42 + c.compact * 1.45 + c.pile_mass * 0.55;
+                    sanitize_f32(raw, 0.0).clamp(0.0, 12.0)
+                }
+            })
+    }
+
+    /// Compacts the pile cell at `world_pos` under dozer tracks or high blade without losing mass.
+    pub fn compact_point(&mut self, world_pos: Vec2, amount: f32) {
+        let safe_amt = sanitize_f32(amount, 0.0).clamp(0.0, 1.0);
+        if safe_amt <= 0.0 {
+            return;
+        }
+        let (gx, gy) = self.world_to_cell(world_pos);
+        if let Some(idx) = self.cell_index(gx, gy)
+            && let Some(cell) = self.cells.get_mut(idx)
+            && (cell.pile_mass > 0.0 || cell.height > 0.0)
+        {
+            cell.compact = sanitize_f32(cell.compact + safe_amt, cell.compact).clamp(0.0, 1.0);
+            cell.height = sanitize_f32(
+                cell.height * (1.0 - safe_amt * 0.16).clamp(0.72, 1.0),
+                cell.height,
+            )
+            .max(0.0);
+        }
+    }
+
+    /// Extracts up to `max_extract` loose pile mass within `radius` of `center` (`extractPileDisk` in `pile.ts`),
+    /// returning `(extracted_mass, dominant_material)`.
+    pub fn extract_disk(
+        &mut self,
+        center: Vec2,
+        radius: f32,
+        max_extract: f32,
+    ) -> (f32, MaterialKind) {
+        let safe_center = sanitize_vec2(center, Vec2::ZERO);
+        let safe_radius = sanitize_f32(radius, 16.0).clamp(1.0, 96.0);
+        let budget = sanitize_f32(max_extract, 0.0).max(0.0);
+        if budget <= 0.0 {
+            return (0.0, MaterialKind::Concrete);
+        }
+
+        let (cx, cy) = self.world_to_interior_cell(safe_center);
+        let cell_span = ((safe_radius / self.cell_size.max(1.0)).ceil() as i32).clamp(1, 3);
+        let mut extracted_total = 0.0_f32;
+        let mut dom_mat = MaterialKind::Concrete;
+
+        for dy in -cell_span..=cell_span {
+            for dx in -cell_span..=cell_span {
+                if extracted_total >= budget {
+                    break;
+                }
+                let nx = (cx as i32).saturating_add(dx).max(0) as usize;
+                let ny = (cy as i32).saturating_add(dy).max(0) as usize;
+                if let Some(idx) = self.cell_index(nx, ny)
+                    && let Some(cell) = self.cells.get_mut(idx)
+                    && cell.pile_mass > 0.01
+                {
+                    let take = (cell.pile_mass * 0.35).min(budget - extracted_total);
+                    if take > 0.0 {
+                        let prev_mass = cell.pile_mass.max(take);
+                        cell.pile_mass = (cell.pile_mass - take).max(0.0);
+                        let ratio = (cell.pile_mass / prev_mass).clamp(0.0, 1.0);
+                        cell.height *= ratio;
+                        extracted_total += take;
+                        dom_mat = cell.material;
+                    }
+                }
+            }
+        }
+
+        (sanitize_f32(extracted_total, 0.0), dom_mat)
+    }
+
+    /// Scoops pile mass under a lowered blade at `blade_center` and pushes it forward along
+    /// `forward_dir` while strictly conserving total `PileField` mass.
+    pub fn push_pile_with_blade(
+        &mut self,
+        blade_center: Vec2,
+        forward_dir: Vec2,
+        radius: f32,
+        max_transfer: f32,
+    ) {
+        let dir = sanitize_vec2(forward_dir, Vec2::X).normalize_or_zero();
+        if dir.length_squared() <= 0.1 {
+            return;
+        }
+        let (extracted, mat) = self.extract_disk(blade_center, radius, max_transfer);
+        if extracted > 0.0 {
+            let deposit_pos = blade_center + dir * (radius.max(12.0) * 1.15);
+            self.add_mass(deposit_pos, extracted, mat);
+        }
+        self.compact_point(blade_center, 0.08);
+    }
+
+    /// Returns the total mass across all cells in the `PileField`.
+    #[must_use]
+    pub fn total_mass(&self) -> f32 {
+        let sum: f32 = self
+            .cells
+            .iter()
+            .map(|c| sanitize_f32(c.pile_mass, 0.0).max(0.0))
+            .sum();
+        sanitize_f32(sum, 0.0)
+    }
+
+    /// Returns the number of cells containing measurable pile mass (`> 0.05`).
+    #[must_use]
+    pub fn active_mound_cells(&self) -> usize {
+        self.cells.iter().filter(|c| c.pile_mass > 0.05).count()
+    }
+}
+
 /// Helper that returns or initializes the shared vertex-color `ColorMaterial` handle.
 pub fn get_or_init_shared_iso_material(
     shared_mat: &mut SharedIsoColorMaterial,
@@ -2053,6 +2322,7 @@ pub fn sync_world_on_site_restart_system(
     mut spatial_grid: ResMut<SpatialHashGrid>,
     mut decal_pool: ResMut<GroundDecalPool>,
     mut particle_pool: ResMut<WorldParticlePool>,
+    mut pile_field: ResMut<PileField>,
 ) {
     let mut should_rebuild = road_graph.nodes.is_empty();
     for _ in restart_events.read() {
@@ -2066,6 +2336,7 @@ pub fn sync_world_on_site_restart_system(
     spatial_grid.clear();
     decal_pool.clear();
     particle_pool.clear();
+    pile_field.clear();
 }
 
 /// Spawns the multi-layered isometric ground tilemap (`bevy_ecs_tilemap` `TileStorage` + interlocking
@@ -2535,6 +2806,7 @@ impl Plugin for PdWorldPlugin {
             .init_resource::<ProceduralWorldAtlas>()
             .init_resource::<GroundDecalPool>()
             .init_resource::<WorldParticlePool>()
+            .init_resource::<PileField>()
             .init_resource::<SharedIsoColorMaterial>()
             .add_systems(Startup, init_procedural_world_atlas_system)
             .add_systems(
@@ -2556,6 +2828,39 @@ impl Plugin for PdWorldPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pile_field_mass_conservation_resistance_and_blade_push() {
+        let mut pile = PileField::default();
+        assert!(pile.total_mass() <= 1e-6);
+
+        let drop_pos = Vec2::new(-120.0, 45.0);
+        pile.add_mass(drop_pos, 18.5, MaterialKind::Brick);
+        assert!((pile.total_mass() - 18.5).abs() < 1e-3);
+        assert!(pile.height_at(drop_pos) > 0.0);
+        assert!(pile.pile_resistance_at(drop_pos) > 0.0);
+        assert!(pile.active_mound_cells() >= 9);
+
+        // Compacting increases compaction and lowers loose height while strictly preserving mass
+        let h_before = pile.height_at(drop_pos);
+        pile.compact_point(drop_pos, 0.5);
+        assert!((pile.total_mass() - 18.5).abs() < 1e-3);
+        assert!(pile.height_at(drop_pos) < h_before);
+
+        // Pushing pile with lowered blade transfers mass forward while conserving total mass
+        let forward_pos = drop_pos + Vec2::new(24.0, 0.0);
+        let forward_h_before = pile.height_at(forward_pos);
+        pile.push_pile_with_blade(drop_pos, Vec2::X, 20.0, 6.0);
+        assert!((pile.total_mass() - 18.5).abs() < 1e-3);
+        assert!(pile.height_at(forward_pos) > forward_h_before);
+
+        // Non-finite inputs are safely ignored without corrupting total mass
+        pile.add_mass(Vec2::splat(f32::NAN), f32::NAN, MaterialKind::Concrete);
+        assert!((pile.total_mass() - 18.5).abs() < 1e-3);
+
+        pile.clear();
+        assert!(pile.total_mass() <= 1e-6);
+    }
 
     #[test]
     fn test_grid_and_atlas_bounds_safety() {

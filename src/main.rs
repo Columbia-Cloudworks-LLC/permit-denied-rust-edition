@@ -15,15 +15,17 @@ use pd_core::{
 };
 use pd_destruction::{
     BuildingGraphRegistry, DebrisChunk, DebrisPoolRegistry, DebrisTier, DestructibleProp,
-    ModularBuilding, NodeIndex, PdDestructionPlugin, PropArchetype, build_building_iso_assembly,
-    queue_structural_integrity_evaluation, spawn_pooled_debris_chunk,
+    MAX_EXPLOSION_GENERATION, ModularBuilding, NodeIndex, PdDestructionPlugin,
+    apply_prop_damage_and_profile, build_building_compound_collider,
+    build_building_iso_assembly_from_entry, queue_structural_integrity_evaluation,
+    spawn_pooled_debris_chunk_with_material,
 };
 use pd_dozer::{
-    BladeState, PdDozerPlugin, PlayerVehicle, TrackInput, UpgradeMultipliers, apply_dozer_impulse,
-    compute_blade_contact_points,
+    BladeState, MechanicalStress, PdDozerPlugin, PlayerVehicle, TrackInput, UpgradeMultipliers,
+    apply_dozer_impulse, compute_blade_contact_points,
 };
 use pd_ui::PdUiPlugin;
-use pd_world::{CutawayFootprint, PdWorldPlugin};
+use pd_world::{CutawayFootprint, PdWorldPlugin, PileField};
 
 /// Marker component for the isometric 2.5D orthographic camera.
 #[derive(Component, Debug, Clone, Copy, Default)]
@@ -209,22 +211,37 @@ fn camera_follow_and_cutaway_system(
     }
 }
 
-/// Evaluates dozer blade impacts against modular buildings, interior/exterior props, and sleeping
-/// rubble in Cartesian `WorldPose` space (crushing Tier 2 sleeping rubble into Tier 3 ground
-/// decal scars when `BladeDown`).
+/// Pre-allocated scratch buffers for `evaluate_dozer_structural_impacts_system` (Zero Heap Churn).
+#[derive(Default)]
+pub struct ImpactScratch {
+    pub destroyed_ids: Vec<NodeIndex>,
+    pub candidate_cells: Vec<(NodeIndex, f32)>,
+    pub blast_queue: Vec<(Vec2, f32, f32, u8)>,
+}
+
+/// Evaluates dozer blade impacts against modular buildings (spatial per-cell wall breaching with
+/// material HP & cladding), interior/exterior props (7 data-driven destruction profiles & chained
+/// explosions), and `PileField` / sleeping rubble mass conservation (`Epic #3`).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn evaluate_dozer_structural_impacts_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
     blade_state: Res<BladeState>,
     upgrades: Res<UpgradeMultipliers>,
-    mut track_input: ResMut<TrackInput>,
-    mut graph_registry: ResMut<BuildingGraphRegistry>,
-    mut debris_pool: ResMut<DebrisPoolRegistry>,
-    mut cash_events: EventWriter<DemolitionCashEvent>,
-    mut decal_events: EventWriter<DecalSpawnRequest>,
-    mut particle_events: EventWriter<ParticleBurstEvent>,
-    mut audio_events: EventWriter<AudioTriggerEvent>,
-    mut destroyed_ids: Local<Vec<NodeIndex>>,
+    (mut track_input, mut stress, mut graph_registry, mut debris_pool, mut pile_field): (
+        ResMut<TrackInput>,
+        ResMut<MechanicalStress>,
+        ResMut<BuildingGraphRegistry>,
+        ResMut<DebrisPoolRegistry>,
+        ResMut<PileField>,
+    ),
+    (mut cash_events, mut decal_events, mut particle_events, mut audio_events): (
+        EventWriter<DemolitionCashEvent>,
+        EventWriter<DecalSpawnRequest>,
+        EventWriter<ParticleBurstEvent>,
+        EventWriter<AudioTriggerEvent>,
+    ),
+    mut scratch: Local<ImpactScratch>,
     mut dozer_query: Query<
         (
             &mut PlayerVehicle,
@@ -247,8 +264,14 @@ pub fn evaluate_dozer_structural_impacts_system(
         ),
         (With<ModularBuilding>, Without<PlayerVehicle>),
     >,
-    prop_query: Query<
-        (Entity, Option<&WorldPose>, &Transform, &DestructibleProp),
+    mut prop_query: Query<
+        (
+            Entity,
+            Option<&mut WorldPose>,
+            &Transform,
+            &mut DestructibleProp,
+            Option<&mut IsoExtrudedBox>,
+        ),
         (Without<PlayerVehicle>, Without<ModularBuilding>),
     >,
     mut sleeping_rubble_query: Query<
@@ -273,11 +296,14 @@ pub fn evaluate_dozer_structural_impacts_system(
         |p| sanitize_f32(p.heading_rad, 0.0),
     );
     let dozer_rot = Rotation::radians(dozer_heading);
+    let forward_dir = Vec2::new(dozer_heading.cos(), dozer_heading.sin());
+    let dozer_speed = Vec2::new(dozer_veh.vx, dozer_veh.vy).length();
     let blade_down = *blade_state == BladeState::BladeDown;
     let blade_points = compute_blade_contact_points(dozer_xy, dozer_heading, blade_down);
+    let safe_upgrades = upgrades.sanitized();
     let push_force_mul = dozer_veh
         .pushing_force_multiplier
-        .max(upgrades.sanitized().aux_ram)
+        .max(safe_upgrades.aux_ram)
         .clamp(1.0, pd_dozer::MAX_SAFE_MULTIPLIER);
     let slam_bonus = if dozer_veh.blade_landed_this_tick {
         10.0
@@ -286,11 +312,20 @@ pub fn evaluate_dozer_structural_impacts_system(
     };
     let task_pool = AsyncComputeTaskPool::get();
 
-    let mut contact_load = 0.0_f32;
+    // Sample PileField drag/resistance under the dozer and push/compact heaps (`Issue #16`)
+    let pile_res = pile_field.pile_resistance_at(dozer_xy);
+    let mut contact_load = (pile_res * 0.45).clamp(0.0, 2.5);
+    pile_field.compact_point(dozer_xy, 0.04);
+    if blade_down && dozer_speed > 6.0 {
+        let front_tip = blade_points.get(2).copied().unwrap_or(dozer_xy);
+        pile_field.push_pile_with_blade(front_tip, forward_dir, 20.0, 0.45 * push_force_mul);
+    }
+
     let mut max_penetration_meters = 0.0_f32;
     let mut deepest_contact_normal = Vec2::Y;
+    scratch.blast_queue.clear();
 
-    // 1. Evaluate building structural impacts via 5-point blade contact array & hull footprint
+    // 1. Evaluate spatial per-cell building structural impacts via 5-point blade contact array & hull (`Issue #14`)
     for (b_entity, b_pose, b_tf, b_collider, b_meta, mut cutaway, base_box, assembly) in
         &mut building_query
     {
@@ -328,50 +363,95 @@ pub fn evaluate_dozer_structural_impacts_system(
             None
         };
 
-        destroyed_ids.clear();
-        if let Some(entry) = graph_registry.buildings.get(&b_entity)
-            && entry.nodes.values().any(|n| n.intact && n.story_level == 0)
-        {
-            if let Some(contact) = collider_contact {
-                let overlap_meters =
-                    sanitize_f32(contact.penetration / pd_dozer::WORLD_UNITS_PER_METER, 0.0)
-                        .max(0.0);
-                if overlap_meters > max_penetration_meters {
-                    let raw_normal = -contact.global_normal1(&dozer_rot);
-                    let safe_normal = sanitize_vec2(raw_normal, Vec2::Y).normalize_or_zero();
-                    max_penetration_meters = overlap_meters;
-                    deepest_contact_normal = if safe_normal.length_squared() > 1e-4 {
-                        safe_normal
-                    } else {
-                        let fallback_dir =
-                            sanitize_vec2((dozer_xy - b_xy).normalize_or_zero(), Vec2::Y);
-                        if fallback_dir.length_squared() > 1e-4 {
-                            fallback_dir
-                        } else {
-                            Vec2::Y
-                        }
-                    };
-                }
-            }
-
-            let base_nodes = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
-            let max_nodes_per_hit =
-                if dozer_veh.crush_intersecting_block && collider_contact.is_some() {
-                    base_nodes.saturating_add(4)
+        if let Some(contact) = collider_contact {
+            let overlap_meters =
+                sanitize_f32(contact.penetration / pd_dozer::WORLD_UNITS_PER_METER, 0.0).max(0.0);
+            if overlap_meters > max_penetration_meters {
+                let raw_normal = -contact.global_normal1(&dozer_rot);
+                let safe_normal = sanitize_vec2(raw_normal, Vec2::Y).normalize_or_zero();
+                max_penetration_meters = overlap_meters;
+                deepest_contact_normal = if safe_normal.length_squared() > 1e-4 {
+                    safe_normal
                 } else {
-                    base_nodes
-                };
-            for (&id, node) in &entry.nodes {
-                if node.intact && node.story_level == 0 {
-                    destroyed_ids.push(id);
-                    if destroyed_ids.len() >= max_nodes_per_hit {
-                        break;
+                    let fallback_dir =
+                        sanitize_vec2((dozer_xy - b_xy).normalize_or_zero(), Vec2::Y);
+                    if fallback_dir.length_squared() > 1e-4 {
+                        fallback_dir
+                    } else {
+                        Vec2::Y
                     }
-                }
+                };
             }
         }
 
-        if !destroyed_ids.is_empty() {
+        scratch.destroyed_ids.clear();
+        scratch.candidate_cells.clear();
+        let mut any_cell_damaged = false;
+
+        if let Some(entry) = graph_registry.buildings.get_mut(&b_entity) {
+            let blade_cell_radius = 15.5 + slam_bonus * 0.5;
+            let blade_cell_radius_sq = blade_cell_radius * blade_cell_radius;
+            let hull_radius_sq = 25.0 * 25.0;
+
+            for (&id, node) in &entry.nodes {
+                if !node.intact || node.story_level != 0 {
+                    continue;
+                }
+                let (w_min, w_max) = node.world_bounds(b_xy);
+                let min_blade_sq = blade_points
+                    .iter()
+                    .map(|pt| pt.distance_squared(pt.clamp(w_min, w_max)))
+                    .fold(f32::MAX, f32::min);
+                let hull_sq = dozer_xy.distance_squared(dozer_xy.clamp(w_min, w_max));
+
+                if min_blade_sq <= blade_cell_radius_sq
+                    || (dozer_veh.crush_intersecting_block && hull_sq <= hull_radius_sq)
+                {
+                    scratch
+                        .candidate_cells
+                        .push((id, min_blade_sq.min(hull_sq)));
+                }
+            }
+
+            if !scratch.candidate_cells.is_empty() {
+                scratch.candidate_cells.sort_by(|a, b| {
+                    a.1.partial_cmp(&b.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+
+                let base_nodes = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
+                let max_nodes_per_hit =
+                    if dozer_veh.crush_intersecting_block && collider_contact.is_some() {
+                        base_nodes.saturating_add(4)
+                    } else {
+                        base_nodes
+                    };
+
+                let blade_mul = if blade_down { 1.45 } else { 0.90 };
+                let cell_damage = (32.0 + dozer_speed * 0.35 + slam_bonus * 3.5)
+                    * safe_upgrades.ar400_edge
+                    * push_force_mul
+                    * blade_mul;
+
+                let scratch_ref = &mut *scratch;
+                for &(cell_id, _) in scratch_ref.candidate_cells.iter().take(max_nodes_per_hit) {
+                    if let Some(node) = entry.nodes.get_mut(&cell_id) {
+                        any_cell_damaged = true;
+                        if node.apply_localized_damage(cell_damage) {
+                            scratch_ref.destroyed_ids.push(cell_id);
+                        }
+                    }
+                }
+            }
+
+            if any_cell_damaged {
+                entry.visual_revision = entry.visual_revision.saturating_add(1);
+                entry.refresh_surface_cache();
+            }
+        }
+
+        if any_cell_damaged {
             contact_load += 1.5;
             let recoil_dir = (dozer_xy - b_xy).normalize_or_zero();
             let recoil_bounce = (0.12 / push_force_mul).clamp(0.02, 0.12);
@@ -400,61 +480,77 @@ pub fn evaluate_dozer_structural_impacts_system(
                 world_pos: b_xy,
                 count: 5,
             });
+        }
 
-            let b_screen = world_to_iso_screen(b_xy, 8.0);
-            for &id in &destroyed_ids {
-                let cash_val = graph_registry
+        if !scratch.destroyed_ids.is_empty() {
+            for &id in &scratch.destroyed_ids {
+                let (cash_val, cell_world, cell_mat) = graph_registry
                     .buildings
                     .get(&b_entity)
                     .and_then(|e| e.nodes.get(&id))
-                    .map_or(16, |n| n.cash_value);
-
+                    .map_or((16, b_xy, pd_core::MaterialKind::Concrete), |n| {
+                        (n.cash_value, n.world_center(b_xy), n.material)
+                    });
+                let cell_screen = world_to_iso_screen(cell_world, 8.0);
                 cash_events.send(DemolitionCashEvent {
                     amount: cash_val,
-                    world_pos: b_screen.extend(0.0),
+                    world_pos: cell_screen.extend(0.0),
                 });
-                spawn_pooled_debris_chunk(&mut commands, &mut debris_pool, *epoch, b_xy, 0);
+                spawn_pooled_debris_chunk_with_material(
+                    &mut commands,
+                    &mut debris_pool,
+                    *epoch,
+                    cell_world,
+                    0,
+                    cell_mat,
+                    cell_mat.density(),
+                    false,
+                    Some(forward_dir * 22.0),
+                );
             }
 
             let _ = queue_structural_integrity_evaluation(
                 b_entity,
-                &destroyed_ids,
+                &scratch.destroyed_ids,
                 &mut graph_registry,
                 task_pool,
             );
+        }
 
-            if let Some(entry) = graph_registry.buildings.get(&b_entity) {
-                let has_intact_ground_story = entry
-                    .nodes
-                    .values()
-                    .any(|n| n.intact && n.story_level == 0);
-                if !has_intact_ground_story
-                    && let Some(mut b_cmds) = commands.get_entity(b_entity)
-                {
+        if any_cell_damaged && let Some(entry) = graph_registry.buildings.get(&b_entity) {
+            if !scratch.destroyed_ids.is_empty()
+                && let Some(mut b_cmds) = commands.get_entity(b_entity)
+            {
+                if let Some(new_col) = build_building_compound_collider(&entry.nodes) {
+                    b_cmds.insert(new_col);
+                } else {
                     b_cmds
                         .remove::<RigidBody>()
                         .remove::<Collider>()
                         .remove::<Position>()
                         .remove::<Rotation>();
                 }
-                if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
-                    let (mut new_base, mut new_asm) = build_building_iso_assembly(
-                        &entry.nodes,
-                        b_meta.stories,
-                        b_meta.palette_index,
-                    );
-                    new_base.alpha = cutaway.current_roof_alpha;
-                    new_asm.alpha_multiplier = cutaway.current_roof_alpha;
-                    *b_box = new_base;
-                    *asm = new_asm;
-                }
+            }
+            if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
+                let (mut new_base, mut new_asm) = build_building_iso_assembly_from_entry(
+                    entry,
+                    b_meta.stories,
+                    b_meta.palette_index,
+                );
+                new_base.alpha = cutaway.current_roof_alpha;
+                new_asm.alpha_multiplier = cutaway.current_roof_alpha;
+                *b_box = new_base;
+                *asm = new_asm;
             }
         }
     }
 
-    // 2. Evaluate interior furniture & exterior street prop destruction
-    for (prop_entity, prop_pose, prop_tf, prop) in &prop_query {
-        let p_xy = prop_pose.map_or_else(
+    // 2. Evaluate interior furniture & exterior street prop impacts using the 7 destruction profiles (`Issue #17`)
+    let prop_damage = (38.0 + dozer_speed * 0.4 + slam_bonus * 4.0)
+        * safe_upgrades.ar400_edge
+        * push_force_mul;
+    for (prop_entity, mut prop_pose, prop_tf, mut prop, mut prop_box) in &mut prop_query {
+        let p_xy = prop_pose.as_deref().map_or_else(
             || sanitize_vec2(prop_tf.translation.truncate(), Vec2::ZERO),
             |p| sanitize_vec2(p.pos, Vec2::ZERO),
         );
@@ -481,84 +577,183 @@ pub fn evaluate_dozer_structural_impacts_system(
             );
             veh.vx = vel_mut.x;
             veh.vy = vel_mut.y;
-            let p_screen = world_to_iso_screen(p_xy, 4.0);
-            cash_events.send(DemolitionCashEvent {
-                amount: prop.archetype.cash_value(),
-                world_pos: p_screen.extend(0.0),
-            });
 
-            match prop.archetype {
-                PropArchetype::Toilet | PropArchetype::FireHydrant => {
-                    particle_events.send(ParticleBurstEvent {
-                        kind: ParticleBurstKind::WaterSpray,
-                        world_pos: p_xy,
-                        count: 10,
-                    });
-                    audio_events.send(AudioTriggerEvent {
-                        kind: AudioSfxKind::BladeHydraulicHiss,
-                    });
-                }
-                PropArchetype::PropaneTank => {
-                    particle_events.send(ParticleBurstEvent {
-                        kind: ParticleBurstKind::PropaneExplosion,
-                        world_pos: p_xy,
-                        count: 14,
-                    });
-                    decal_events.send(DecalSpawnRequest {
-                        kind: DecalKind::ScorchMark,
-                        world_pos: p_xy,
-                        size: Vec2::new(42.0, 32.0),
-                        rotation_rad: 0.0,
-                    });
-                    audio_events.send(AudioTriggerEvent {
-                        kind: AudioSfxKind::PropaneBlast,
-                    });
-                }
-                PropArchetype::CashRegister => {
-                    audio_events.send(AudioTriggerEvent {
-                        kind: AudioSfxKind::CashDing,
-                    });
-                }
-                _ => {
-                    audio_events.send(AudioTriggerEvent {
-                        kind: AudioSfxKind::StructuralCrunch,
-                    });
-                }
+            let impact_dir = (p_xy - dozer_xy).normalize_or_zero();
+            let (_destroyed, stress_delta, maybe_blast) = apply_prop_damage_and_profile(
+                &mut commands,
+                *epoch,
+                prop_entity,
+                p_xy,
+                &mut prop,
+                prop_pose.as_deref_mut(),
+                prop_box.as_deref_mut(),
+                prop_damage,
+                impact_dir,
+                blade_down,
+                &mut debris_pool,
+                &mut pile_field,
+                &mut cash_events,
+                &mut decal_events,
+                &mut particle_events,
+                &mut audio_events,
+            );
+            if stress_delta > 0.0 {
+                stress.track_stress_pct =
+                    sanitize_f32(stress.track_stress_pct + stress_delta, stress.track_stress_pct)
+                        .clamp(0.0, 1.0);
             }
-
-            if let Some(e_cmds) = commands.get_entity(prop_entity) {
-                e_cmds.despawn_recursive();
+            if let Some(blast) = maybe_blast {
+                scratch.blast_queue.push(blast);
             }
         }
     }
 
-    // 3. Tier 2 -> Tier 3 Heightmap Crushing: Driving over sleeping rubble with BladeDown
-    // flattens the rubble into the persistent ground decal layer.
-    if blade_down {
-        let r_hit_radius = 30.0 + slam_bonus;
-        for (rubble_entity, rubble_pose, rubble_tf, mut chunk) in &mut sleeping_rubble_query {
-            if chunk.tier != DebrisTier::SleepingInstanced {
-                continue;
-            }
-            let r_xy = rubble_pose.map_or_else(
-                || sanitize_vec2(rubble_tf.translation.truncate(), Vec2::ZERO),
+    // 2b. Process chained Explosive prop shockwaves (`Issue #17`, bounded by `MAX_EXPLOSION_GENERATION`)
+    let mut blast_idx = 0_usize;
+    while blast_idx < scratch.blast_queue.len() && blast_idx < 16 {
+        let Some(&(blast_center, blast_radius, blast_dmg, generation)) =
+            scratch.blast_queue.get(blast_idx)
+        else {
+            break;
+        };
+        blast_idx = blast_idx.saturating_add(1);
+        let r_sq = blast_radius * blast_radius;
+
+        // Damage nearby building ground/lower cells within blast_radius
+        for (b_entity, b_pose, b_tf, _, b_meta, cutaway, base_box, assembly) in &mut building_query
+        {
+            let b_xy = b_pose.map_or_else(
+                || sanitize_vec2(b_tf.translation.truncate(), Vec2::ZERO),
                 |p| sanitize_vec2(p.pos, Vec2::ZERO),
             );
-            let blade_hit = blade_points
-                .iter()
-                .any(|pt| pt.distance_squared(r_xy) <= r_hit_radius * r_hit_radius);
-            if blade_hit || dozer_xy.distance_squared(r_xy) <= 38.0 * 38.0 {
-                chunk.tier = DebrisTier::CrushedDecal;
-                debris_pool.active_ring.retain(|&e| e != rubble_entity);
-                decal_events.send(DecalSpawnRequest {
-                    kind: DecalKind::CrushedRubbleScar,
-                    world_pos: r_xy,
-                    size: Vec2::new(18.0, 12.0),
-                    rotation_rad: 0.0,
-                });
-                if let Some(e_cmds) = commands.get_entity(rubble_entity) {
-                    e_cmds.despawn_recursive();
+            scratch.destroyed_ids.clear();
+            let mut b_damaged = false;
+            if let Some(entry) = graph_registry.buildings.get_mut(&b_entity) {
+                for (&nid, node) in &mut entry.nodes {
+                    if node.intact && node.story_level <= 1 {
+                        let c_world = node.world_center(b_xy);
+                        let d_sq = c_world.distance_squared(blast_center);
+                        if d_sq <= r_sq {
+                            b_damaged = true;
+                            let falloff = (1.0 - (d_sq.sqrt() / blast_radius.max(1.0)) * 0.5)
+                                .clamp(0.35, 1.0);
+                            if node.apply_localized_damage(blast_dmg * falloff) {
+                                scratch.destroyed_ids.push(nid);
+                            }
+                        }
+                    }
                 }
+                if b_damaged {
+                    entry.visual_revision = entry.visual_revision.saturating_add(1);
+                    entry.refresh_surface_cache();
+                }
+            }
+            if !scratch.destroyed_ids.is_empty() {
+                let _ = queue_structural_integrity_evaluation(
+                    b_entity,
+                    &scratch.destroyed_ids,
+                    &mut graph_registry,
+                    task_pool,
+                );
+            }
+            if b_damaged && let Some(entry) = graph_registry.buildings.get(&b_entity) {
+                if !scratch.destroyed_ids.is_empty()
+                    && let Some(mut b_cmds) = commands.get_entity(b_entity)
+                {
+                    if let Some(new_col) = build_building_compound_collider(&entry.nodes) {
+                        b_cmds.insert(new_col);
+                    } else {
+                        b_cmds
+                            .remove::<RigidBody>()
+                            .remove::<Collider>()
+                            .remove::<Position>()
+                            .remove::<Rotation>();
+                    }
+                }
+                if let (Some(mut b_box), Some(mut asm)) = (base_box, assembly) {
+                    let (mut new_base, mut new_asm) = build_building_iso_assembly_from_entry(
+                        entry,
+                        b_meta.stories,
+                        b_meta.palette_index,
+                    );
+                    new_base.alpha = cutaway.current_roof_alpha;
+                    new_asm.alpha_multiplier = cutaway.current_roof_alpha;
+                    *b_box = new_base;
+                    *asm = new_asm;
+                }
+            }
+        }
+
+        // Chain blast to nearby props if generation < MAX_EXPLOSION_GENERATION
+        if generation < MAX_EXPLOSION_GENERATION {
+            for (prop_entity, mut prop_pose, prop_tf, mut prop, mut prop_box) in &mut prop_query {
+                if prop.hp <= 0.0 {
+                    continue;
+                }
+                let p_xy = prop_pose.as_deref().map_or_else(
+                    || sanitize_vec2(prop_tf.translation.truncate(), Vec2::ZERO),
+                    |p| sanitize_vec2(p.pos, Vec2::ZERO),
+                );
+                let d_sq = p_xy.distance_squared(blast_center);
+                if d_sq > 1.0 && d_sq <= r_sq {
+                    prop.chain_generation = generation.saturating_add(1);
+                    let dir = (p_xy - blast_center).normalize_or_zero();
+                    let (_, _, next_blast) = apply_prop_damage_and_profile(
+                        &mut commands,
+                        *epoch,
+                        prop_entity,
+                        p_xy,
+                        &mut prop,
+                        prop_pose.as_deref_mut(),
+                        prop_box.as_deref_mut(),
+                        blast_dmg,
+                        dir,
+                        true,
+                        &mut debris_pool,
+                        &mut pile_field,
+                        &mut cash_events,
+                        &mut decal_events,
+                        &mut particle_events,
+                        &mut audio_events,
+                    );
+                    if let Some(nb) = next_blast {
+                        scratch.blast_queue.push(nb);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Tier 2 -> Tier 3 Heightmap & PileField Crushing: Driving over sleeping rubble with BladeDown
+    // transfers its conserved mass into `PileField` and spawns a ground decal scar (`Issue #16`).
+    let r_hit_radius = 30.0 + slam_bonus;
+    for (rubble_entity, rubble_pose, rubble_tf, mut chunk) in &mut sleeping_rubble_query {
+        let r_xy = rubble_pose.map_or_else(
+            || sanitize_vec2(rubble_tf.translation.truncate(), Vec2::ZERO),
+            |p| sanitize_vec2(p.pos, Vec2::ZERO),
+        );
+        if dozer_xy.distance_squared(r_xy) <= 52.0 * 52.0 {
+            chunk.recently_touched_secs = 1.2;
+            chunk.unattended_secs = 0.0;
+        }
+        if !blade_down || chunk.tier != DebrisTier::SleepingInstanced {
+            continue;
+        }
+        let blade_hit = blade_points
+            .iter()
+            .any(|pt| pt.distance_squared(r_xy) <= r_hit_radius * r_hit_radius);
+        if blade_hit || dozer_xy.distance_squared(r_xy) <= 38.0 * 38.0 {
+            chunk.tier = DebrisTier::CrushedDecal;
+            pile_field.add_mass(r_xy, chunk.mass, chunk.material);
+            debris_pool.active_ring.retain(|&e| e != rubble_entity);
+            decal_events.send(DecalSpawnRequest {
+                kind: DecalKind::CrushedRubbleScar,
+                world_pos: r_xy,
+                size: Vec2::new(18.0, 12.0),
+                rotation_rad: 0.0,
+            });
+            if let Some(e_cmds) = commands.get_entity(rubble_entity) {
+                e_cmds.despawn_recursive();
             }
         }
     }
@@ -854,6 +1049,7 @@ mod tests {
                 vertical_z_velocity: 0.0,
                 horizontal_velocity: Vec2::ZERO,
                 spin_rate: 0.0,
+                ..Default::default()
             },
             WorldPose::from_xy(0.0, -60.0),
             Transform::from_xyz(0.0, -60.0, 0.0),
@@ -1169,6 +1365,7 @@ mod tests {
                 vertical_z_velocity: 0.0,
                 horizontal_velocity: Vec2::ZERO,
                 spin_rate: 0.0,
+                ..Default::default()
             },
             WorldPose::from_xy(52.0, -60.0),
             Transform::from_xyz(52.0, -60.0, 0.0),
@@ -1203,6 +1400,7 @@ mod tests {
                     vertical_z_velocity: 0.0,
                     horizontal_velocity: Vec2::ZERO,
                     spin_rate: 0.0,
+                    ..Default::default()
                 },
                 WorldPose::from_xy(120.0, -60.0),
                 Transform::from_xyz(120.0, -60.0, 0.0),
@@ -1374,6 +1572,260 @@ mod tests {
             track_in.contact_normal.y < -0.99,
             "Expected recovery normal pointing along -Y away from building, got {:?}",
             track_in.contact_normal
+        );
+    }
+
+    /// Epic #3 Verification Test:
+    /// 1. Spatial Per-Cell Wall Breaching (#14): Breaching the south wall cells of a ranch building
+    ///    removes solid collision from those breached cells so the dozer can drive inside the
+    ///    interior room while the intact north/east/west walls continue blocking.
+    /// 2. Merged Exterior Wall Spans & Sagging Roof Bays (#15): Losing `< 55%` of a roof bay's
+    ///    supporting nodes transitions the bay `Intact -> Sagging -> Collapsed`, spawns pushable
+    ///    roof remnants, and never pays a duplicate full-building collapse bonus.
+    /// 3. Mass-Conserving Debris, `PileField` & `CollapsedSite` (#16): Crushing rubble transfers
+    ///    exact mass into `PileField`, increases `pile_resistance_at`, and reaching `>= 90%`
+    ///    settled building destruction spawns a `CollapsedSite` scar and awards the one-time
+    ///    full-building collapse bonus.
+    /// 4. 7 Destruction Profiles & Bounded Chained Explosions (#17): `Explosive` propane tanks
+    ///    chain-detonate nearby explosive props up to `MAX_EXPLOSION_GENERATION` without infinite
+    ///    recursion and damage adjacent building cells.
+    #[test]
+    fn test_epic_3_per_cell_breach_sagging_roofs_pile_field_and_7_profiles() {
+        AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(2).build());
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            StatesPlugin,
+            TransformPlugin,
+            HierarchyPlugin,
+        ))
+        .init_asset::<Image>()
+        .init_asset::<TextureAtlasLayout>()
+        .init_asset::<Mesh>()
+        .init_asset::<ColorMaterial>()
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(4),
+        ))
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_plugins((
+            PdCorePlugin,
+            PdWorldPlugin,
+            PdDozerPlugin,
+            PdDestructionPlugin,
+            PdAiPlugin,
+            PdUiPlugin,
+        ))
+        .add_systems(
+            Update,
+            (
+                evaluate_dozer_structural_impacts_system,
+                pd_destruction::poll_structural_collapse_tasks_system,
+                pd_destruction::step_building_roofs_and_collapse_sites_system,
+                pd_destruction::update_debris_lifecycle_system,
+            )
+                .chain()
+                .after(PdSystemSet::WorldTilemapSync),
+        );
+
+        app.world_mut().resource_mut::<EnvironmentConfig>().mode = pd_core::GameMode::Sandbox;
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        for _ in 0..3 {
+            app.update();
+        }
+
+        // 1. Locate first building at (-160, 120) and breach its south wall center cell (0, -2) -> world (-160, 90)
+        let first_building = app
+            .world_mut()
+            .query_filtered::<Entity, With<ModularBuilding>>()
+            .iter(app.world())
+            .next()
+            .unwrap_or(Entity::PLACEHOLDER);
+        assert_ne!(first_building, Entity::PLACEHOLDER);
+
+        // Position dozer with BladeDown facing +Y right at the south wall center cell (-160, 68)
+        *app.world_mut().resource_mut::<BladeState>() = BladeState::BladeDown;
+        {
+            let mut dozer_q = app
+                .world_mut()
+                .query_filtered::<(&mut PlayerVehicle, &mut WorldPose, &mut Position), With<PlayerVehicle>>();
+            for (mut veh, mut pose, mut pos) in dozer_q.iter_mut(app.world_mut()) {
+                pose.pos = Vec2::new(-160.0, 68.0);
+                pose.heading_rad = std::f32::consts::FRAC_PI_2;
+                pos.0 = pose.pos;
+                veh.vx = 0.0;
+                veh.vy = 45.0;
+                veh.pushing_force_multiplier = 2.0;
+            }
+        }
+        app.update();
+
+        // Verify south wall cells near (-160, 90) took localized damage/breached while north wall (gy == 2) stayed intact!
+        {
+            let reg = app.world().resource::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get(&first_building) {
+                let south_damaged = entry
+                    .nodes
+                    .values()
+                    .any(|n| n.story_level == 0 && n.grid_y == -2 && (!n.intact || n.hp < n.max_hp));
+                let north_all_intact = entry
+                    .nodes
+                    .values()
+                    .filter(|n| n.story_level == 0 && n.grid_y == 2)
+                    .all(|n| n.intact && (n.hp - n.max_hp).abs() < 1e-4);
+                assert!(south_damaged, "South wall cells under the blade must take localized damage");
+                assert!(north_all_intact, "Opposite north wall cells must remain untouched");
+            }
+        }
+
+        // 2. Remove > 45% of supporting nodes for Center RoofBay (bay_id == 1) and verify Intact -> Sagging -> Collapsed!
+        {
+            let mut reg = app.world_mut().resource_mut::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get_mut(&first_building) {
+                let sup_ids: Vec<NodeIndex> = entry
+                    .roof_bays
+                    .iter()
+                    .find(|b| b.bay_id == 1)
+                    .map(|b| b.support_nodes.clone())
+                    .unwrap_or_default();
+                assert!(!sup_ids.is_empty());
+                for id in sup_ids {
+                    if let Some(n) = entry.nodes.get_mut(&id) {
+                        n.intact = false;
+                        n.hp = 0.0;
+                    }
+                }
+            }
+        }
+        app.update();
+
+        // Bay 1 should now be in RoofBayState::Sagging!
+        {
+            let reg = app.world().resource::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get(&first_building) {
+                let bay1 = entry.roof_bays.iter().find(|b| b.bay_id == 1);
+                assert!(
+                    bay1.is_some_and(|b| matches!(b.state, pd_destruction::RoofBayState::Sagging { .. })),
+                    "Center roof bay must enter Sagging state when >45% of its support nodes are removed"
+                );
+                assert!(
+                    !entry.collapse_bonus_paid,
+                    "Partial roof bay sag/collapse must not trigger the full-building collapse bonus"
+                );
+            }
+        }
+
+        // Advance time so the sagging roof bay finishes hinging and collapses into pushable roof remnants
+        app.world_mut().insert_resource(
+            bevy::time::TimeUpdateStrategy::ManualDuration(std::time::Duration::from_millis(25)),
+        );
+        for _ in 0..25 {
+            app.update();
+        }
+        app.world_mut().insert_resource(
+            bevy::time::TimeUpdateStrategy::ManualDuration(std::time::Duration::from_millis(4)),
+        );
+        {
+            let reg = app.world().resource::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get(&first_building) {
+                let bay1 = entry.roof_bays.iter().find(|b| b.bay_id == 1);
+                assert!(
+                    bay1.is_some_and(|b| b.state == pd_destruction::RoofBayState::Collapsed),
+                    "Sagging roof bay must finish collapsing into RoofBayState::Collapsed"
+                );
+                assert!(
+                    !entry.collapse_bonus_paid,
+                    "Single roof bay collapse must not award full-building collapse bonus"
+                );
+            }
+        }
+
+        // 3. Test Explosive prop chaining (bounded by MAX_EXPLOSION_GENERATION = 1) and PileField mass conservation
+        let epoch = *app.world().resource::<SessionEpoch>();
+        let mass_before = app.world().resource::<PileField>().total_mass();
+        let tank_a = app
+            .world_mut()
+            .spawn((
+                SiteScoped { epoch },
+                DestructibleProp::new(pd_destruction::PropArchetype::PropaneTank, false),
+                WorldPose::from_xy(300.0, -60.0),
+                Transform::from_xyz(300.0, -60.0, 0.0),
+                GlobalTransform::default(),
+            ))
+            .id();
+        let tank_b = app
+            .world_mut()
+            .spawn((
+                SiteScoped { epoch },
+                DestructibleProp::new(pd_destruction::PropArchetype::PropaneTank, false),
+                WorldPose::from_xy(345.0, -60.0),
+                Transform::from_xyz(345.0, -60.0, 0.0),
+                GlobalTransform::default(),
+            ))
+            .id();
+
+        // Move dozer onto tank_a at (300, -60) to trigger primary blast -> chains to tank_b at (345, -60)
+        {
+            let mut dozer_q = app
+                .world_mut()
+                .query_filtered::<(&mut WorldPose, &mut Position), With<PlayerVehicle>>();
+            for (mut pose, mut pos) in dozer_q.iter_mut(app.world_mut()) {
+                pose.pos = Vec2::new(285.0, -60.0);
+                pose.heading_rad = 0.0;
+                pos.0 = pose.pos;
+            }
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(16));
+        app.update();
+
+        assert!(
+            app.world().get_entity(tank_a).is_err(),
+            "Primary PropaneTank must detonate on blade impact"
+        );
+        assert!(
+            app.world().get_entity(tank_b).is_err(),
+            "Secondary PropaneTank within blast radius must chain-detonate"
+        );
+        let mass_after_tanks = app.world().resource::<PileField>().total_mass();
+        assert!(
+            mass_after_tanks > mass_before,
+            "Destroyed props must deposit their conserved mass into PileField"
+        );
+
+        // 4. Destroy >= 90% of `first_building` nodes and verify it transitions into `CollapsedSite`
+        //    and pays `collapse_bonus_paid` exactly once!
+        {
+            let mut reg = app.world_mut().resource_mut::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get_mut(&first_building) {
+                for node in entry.nodes.values_mut() {
+                    node.intact = false;
+                    node.hp = 0.0;
+                }
+            }
+        }
+        app.world_mut()
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(16));
+        app.update();
+
+        {
+            let reg = app.world().resource::<BuildingGraphRegistry>();
+            if let Some(entry) = reg.buildings.get(&first_building) {
+                assert!(entry.collapse_bonus_paid);
+                assert!(entry.collapsed_site_spawned);
+            }
+        }
+        assert!(
+            app.world()
+                .entity(first_building)
+                .get::<pd_world::CollapsedSite>()
+                .is_some(),
+            "Building at >=90% settled destruction must gain CollapsedSite component"
         );
     }
 }
