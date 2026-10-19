@@ -742,7 +742,9 @@ fn eval_box_corners(
             box_world_center.x + fx * along + rx * across,
             box_world_center.y + fy * along + ry * across,
         );
-        let tilt_dz = -along * total_pitch.sin() + across * total_roll.sin();
+        let effective_along = spec.center.x + along;
+        let effective_across = spec.center.y + across;
+        let tilt_dz = -effective_along * total_pitch.sin() + effective_across * total_roll.sin();
         let z_bot = (base_z0 + tilt_dz).max(0.0);
         let top_scale = match spec.roof_slope {
             None => 1.0,

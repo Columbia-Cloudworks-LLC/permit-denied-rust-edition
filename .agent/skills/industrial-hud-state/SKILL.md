@@ -21,7 +21,7 @@ Use this playbook when implementing or modifying `pd_ui` and `pd_core` economy/H
    * **Spatial/Temporal Coalescing:** If an active popup in `popup_pool` is within `COALESCE_RADIUS` (`3.0m`) and spawned within `COALESCE_WINDOW_SECS` (`0.10s`), or if `popup_pool` is at capacity (`50` active slots), coalesce `amount` into the nearest active popup using `saturating_add`.
 2. **Idempotent Site Restart (`Restart Site` / `New Game`):**
    * Increment `SessionEpoch`.
-   * Reset `CashLedger`, elapsed timer, `MechanicalStress`, `UpgradeMultipliers`, and `CashPopupPool`.
+   * Reset `CashLedger`, elapsed timer, `MechanicalStress`, `UpgradeMultipliers` / `UpgradeProgression` (restoring `level_entry_upgrades` on retry, snapshotting installed upgrades on level advance, or resetting to `1.0x` on `New Game`), and `CashPopupPool`.
    * Despawn all site-scoped entities cleanly without leaking UI nodes or audio handles.
 
 ## 2. Verification Gate

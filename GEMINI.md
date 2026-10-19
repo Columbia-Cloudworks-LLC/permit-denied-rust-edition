@@ -56,3 +56,16 @@ Before marking any milestone or subsystem task complete, all three verification 
 1. **Gate 1 (`verify_no_panic_paths`):** `cargo clippy --workspace --all-targets -- -D warnings` passes with zero warnings or errors under the workspace lint rules.
 2. **Gate 2 (`test_kinematic_and_ledger_extremes`):** Unit tests feed extreme/corrupted inputs (`dt = 0.0`, `dt = 999.0`, `NaN`/`INFINITY` vectors, `u32::MAX` cash additions, disconnected single-node buildings) into core functions and assert clean `Err(...)` or clamped `Ok(...)` returns without panicking.
 3. **Gate 3 (`test_idempotent_site_restart`):** Headless Bevy world test spawns a city block, triggers a building collapse, dispatches `Restart Site` mid-collapse, ticks 10 frames, and verifies that the `SessionEpoch` advances, stale async tasks are discarded, and zero orphaned site entities remain.
+
+---
+
+## Rule Group F: Pull Request Feedback Resolution Protocol
+
+Whenever the user asks to review or address feedback on a Pull Request (e.g., `"Address the feedback on this PR"`), all five of the following steps must be executed automatically (see `.agent/skills/address-pr-feedback/SKILL.md`):
+
+1. **Audit Diff, Implement Fixes & Push Code Changes:** Perform a Pre-Push Adversarial & Baseline-Regression Audit across the full `main...HEAD` diff (checking deleted baseline lines, sibling input/UI/kinematic paths, boundary conditions, and doc/skill alignment) so fixes resolve entire bug classes rather than narrow point-lines. Verify all Rule Group E gates (`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`), and push commits to the PR branch.
+2. **Reply to Addressed Feedback:** Post an in-thread reply to each addressed review comment stating **when** (commit SHA and timestamp/date) and **how** (files, functions, and mechanism) it was addressed.
+3. **Reply to Unimplemented Feedback:** Post an in-thread reply to any feedback that was ignored or not implemented explaining **why** it was not implemented.
+4. **Resolve All Review Conversations:** Resolve every addressed/replied review thread on the pull request via the GitHub GraphQL `resolveReviewThread` mutation.
+5. **Post a Top-Level PR Summary Comment:** Post a summary comment on the PR detailing what changes were made and what was not addressed and why.
+
