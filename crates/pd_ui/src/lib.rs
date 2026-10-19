@@ -412,7 +412,7 @@ pub fn ensure_industrial_hud_spawned_system(
                             form.spawn((
                                 ModalSubInfoBannerText,
                                 Text::new(
-                                    "WASD/Arrows: Drive | Space/Shift: Powered Blade Push | 1/2/3: Upgrade | B: Restart",
+                                    "WASD/Arrows: Drive | Space/F/R/Shift: Hold Blade (Powered Push) | 1/2/3: Upgrade | B: Restart",
                                 ),
                                 TextColor(Color::srgb(0.25, 0.24, 0.22)),
                             ));
@@ -758,7 +758,7 @@ pub fn handle_hud_button_interactions_system(
             }
             HudButtonAction::ShowControlsInfo => {
                 telemetry.info_banner = Some(
-                    "WASD/Arrows: Skid-Steer | Space/Shift: Powered Blade Push | 1/2/3: Upgrade | B: Restart".to_string(),
+                    "WASD/Arrows: Skid-Steer | Space/F/R/Shift: Hold Blade (Powered Push) | 1/2/3: Upgrade | B: Restart".to_string(),
                 );
             }
             HudButtonAction::ToggleSoundMute => {
