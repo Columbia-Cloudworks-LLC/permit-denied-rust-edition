@@ -681,19 +681,22 @@ pub fn compute_skid_steer_kinematics(
     let ride_roll = sanitize_f32(input.ride_roll, 0.0).clamp(-ROLL_MAX, ROLL_MAX);
 
     let want_blade = input.blade_pressed || blade_state == BladeState::BladeDown;
-    if want_blade && push_cd <= 0.0 && push_t <= 0.0 {
+    if !want_blade && throttle < -1e-5 {
+        push_t = 0.0;
+    }
+    if want_blade && push_cd <= 0.0 && push_t <= 0.0 && throttle >= -1e-5 {
         push_t = DOZER_PUSH_SECONDS * push_mul;
         push_cd = DOZER_PUSH_COOLDOWN;
     }
+    let push_active_for_step = push_t > 0.0 && throttle >= -1e-5;
     let was_down = input.blade_down;
-    let now_down = want_blade || push_t > 0.0;
+    let now_down = want_blade || push_active_for_step;
     let blade_landed_this_tick = now_down && !was_down;
     if blade_landed_this_tick {
         pitch_vel = sanitize_f32(pitch_vel + PITCH_BLADE_DROP, pitch_vel).clamp(-20.0, 20.0);
     }
 
-    let push_active_for_step = push_t > 0.0;
-    if push_t > 0.0 {
+    if push_active_for_step {
         push_t = (push_t - safe_dt).max(0.0);
     }
     if push_cd > 0.0 && push_t <= 0.0 {
@@ -1218,8 +1221,14 @@ pub fn evaluate_upgrade_milestones_and_hotkeys_system(
     mut progression: ResMut<UpgradeProgression>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
 ) {
-    let _unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
     let state = *app_state.get();
+    if env_config.mode == GameMode::Campaign {
+        if state == AppState::Playing || state == AppState::Paused {
+            let _unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
+        }
+    } else {
+        progression.pending_upgrade_choices = 0;
+    }
 
     let mut choice_applied = false;
     if (state == AppState::Playing || state == AppState::Paused)
@@ -1727,14 +1736,22 @@ mod tests {
         assert!((blade_up_speed - BASE_TOP_SPEED).abs() < 0.5);
 
         // Reverse travel with BladeDown also applies DOZER_BLADE_DOWN_SPEED_DRAG (0.74x)
+        // and defers powered-push timer/cooldown activation until non-reverse throttle.
         let mut rev_down = TrackInput::from_throttle_steer(-1.0, 0.0, true);
-        rev_down.push_cooldown_secs = 2.0;
         for _ in 0..90 {
             let _ = step_virtual_dozer(&mut rev_down, &upgrades, &mut stress, dt);
         }
         assert!(
             (rev_down.vx.abs() - BASE_MAX_REVERSE_SPEED * DOZER_BLADE_DOWN_SPEED_DRAG).abs() < 0.5
         );
+        assert_eq!(rev_down.push_timer_secs, 0.0);
+        assert_eq!(rev_down.push_cooldown_secs, 0.0);
+        let fwd_after_rev = TrackInput::from_throttle_steer(1.0, 0.0, true);
+        rev_down.left_track = fwd_after_rev.left_track;
+        rev_down.right_track = fwd_after_rev.right_track;
+        let _ = step_virtual_dozer(&mut rev_down, &upgrades, &mut stress, dt);
+        assert!(rev_down.push_timer_secs > 0.90);
+        assert!((rev_down.push_cooldown_secs - DOZER_PUSH_COOLDOWN).abs() < 1e-4);
 
         // Verify Aux Ram (+35%) produces strictly higher 1-tick powered-push surge acceleration than 1.0x baseline
         let base_up = UpgradeMultipliers::default();

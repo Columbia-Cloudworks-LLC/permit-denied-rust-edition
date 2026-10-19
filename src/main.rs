@@ -1143,8 +1143,25 @@ mod tests {
         assert!(app.world().get_entity(far_rubble).is_ok());
         app.world_mut().resource_mut::<UpgradeMultipliers>().aux_ram = 1.0;
 
-        // 4. Verify selecting an upgrade while paused in Sandbox mode preserves AppState::Paused
+        // 4. Verify earning >= $350 in Sandbox mode skips Campaign milestone bookkeeping
+        //    (pending_upgrade_choices stays 0 and game remains Playing), and selecting an upgrade
+        //    while paused in Sandbox mode preserves AppState::Paused.
         app.world_mut().resource_mut::<EnvironmentConfig>().mode = pd_core::GameMode::Sandbox;
+        app.world_mut().send_event(DemolitionCashEvent {
+            amount: 600,
+            world_pos: Vec3::ZERO,
+        });
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(*app.world().resource::<State<AppState>>().get(), AppState::Playing);
+        assert_eq!(
+            app.world()
+                .resource::<pd_dozer::UpgradeProgression>()
+                .pending_upgrade_choices,
+            0
+        );
+
         app.world_mut()
             .resource_mut::<NextState<AppState>>()
             .set(AppState::Paused);

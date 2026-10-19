@@ -1037,7 +1037,7 @@ pub fn update_industrial_hud_system(
         } else if is_stress {
             text.0 = format!("TRACK STRESS [{track_glyph}] {:03.0}%", track_pct);
         } else if is_upgrade {
-            if progression.pending_upgrade_choices > 0 {
+            if env_config.mode == GameMode::Campaign && progression.pending_upgrade_choices > 0 {
                 text.0 = format!(
                     "[1] AR400 {:.2}x | [2] Charge-Air {:.2}x | [3] Aux Ram {:.2}x (PICK UPGRADE!)",
                     safe_up.ar400_edge, safe_up.charge_air_kit, safe_up.aux_ram
