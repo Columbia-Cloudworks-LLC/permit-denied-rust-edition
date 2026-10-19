@@ -291,6 +291,7 @@ pub fn evaluate_dozer_structural_impacts_system(
         || sanitize_vec2(dozer_tf.translation.truncate(), Vec2::ZERO),
         |p| sanitize_vec2(p.pos, Vec2::ZERO),
     );
+    debris_pool.dozer_world_pos = dozer_xy;
     let dozer_heading = dozer_pose.map_or_else(
         || sanitize_f32(dozer_tf.rotation.to_euler(EulerRot::ZYX).0, 0.0),
         |p| sanitize_f32(p.heading_rad, 0.0),

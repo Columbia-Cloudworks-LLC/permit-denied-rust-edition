@@ -1252,6 +1252,7 @@ pub struct DebrisPoolRegistry {
     pub active_ring: VecDeque<Entity>,
     pub max_capacity: usize,
     pub total_recycled: u64,
+    pub dozer_world_pos: Vec2,
 }
 
 impl Default for DebrisPoolRegistry {
@@ -1260,6 +1261,7 @@ impl Default for DebrisPoolRegistry {
             active_ring: VecDeque::with_capacity(MAX_ACTIVE_PHYSICS_DEBRIS),
             max_capacity: MAX_ACTIVE_PHYSICS_DEBRIS,
             total_recycled: 0,
+            dozer_world_pos: Vec2::new(0.0, -60.0),
         }
     }
 }
@@ -1267,6 +1269,7 @@ impl Default for DebrisPoolRegistry {
 impl DebrisPoolRegistry {
     pub fn clear(&mut self) {
         self.active_ring.clear();
+        self.dozer_world_pos = Vec2::new(0.0, -60.0);
     }
 
     /// Evicts the oldest active physics debris entity into Tier 2 (`SleepingInstanced`) when the
@@ -2640,7 +2643,7 @@ pub fn update_debris_lifecycle_system(
     let mut sleeping_count: usize = 0;
     cleanup_candidates.clear();
 
-    let dozer_pos = Vec2::new(0.0, -60.0);
+    let dozer_pos = sanitize_vec2(debris_pool.dozer_world_pos, Vec2::new(0.0, -60.0));
 
     for (entity, mut chunk, mut world_pose, mut phys_pos, mut phys_rot, mut transform, lin_vel) in
         &mut debris_query
