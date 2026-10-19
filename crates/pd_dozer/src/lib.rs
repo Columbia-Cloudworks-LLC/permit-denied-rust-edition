@@ -1146,6 +1146,7 @@ pub fn read_dozer_keyboard_input_system(
 
     let blade_just_pressed = keys.just_pressed(KeyCode::Space)
         || keys.just_pressed(KeyCode::KeyF)
+        || keys.just_pressed(KeyCode::KeyR)
         || keys.just_pressed(KeyCode::ShiftLeft);
     if blade_just_pressed && track_input.push_cooldown_secs <= 0.0 && track_input.push_timer_secs <= 0.0 {
         audio_events.send(AudioTriggerEvent {
@@ -1155,6 +1156,7 @@ pub fn read_dozer_keyboard_input_system(
 
     track_input.blade_pressed = keys.pressed(KeyCode::Space)
         || keys.pressed(KeyCode::KeyF)
+        || keys.pressed(KeyCode::KeyR)
         || keys.pressed(KeyCode::ShiftLeft);
 
     let mut forward = 0.0_f32;
@@ -1957,5 +1959,42 @@ mod tests {
         // In Sandbox mode, upgrades can be applied immediately without pending milestones
         assert!(prog.try_apply_choice(&mut upgrades, GameMode::Sandbox, UpgradeChoice::AuxRam));
         assert!((upgrades.aux_ram - 1.35).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_read_dozer_keyboard_input_supports_all_documented_blade_keys() {
+        for key in [
+            KeyCode::Space,
+            KeyCode::KeyF,
+            KeyCode::KeyR,
+            KeyCode::ShiftLeft,
+        ] {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins);
+            app.init_resource::<ButtonInput<KeyCode>>();
+            app.init_resource::<TrackInput>();
+            app.add_event::<AudioTriggerEvent>();
+            app.add_systems(Update, read_dozer_keyboard_input_system);
+
+            if let Some(mut keys) = app.world_mut().get_resource_mut::<ButtonInput<KeyCode>>() {
+                keys.press(key);
+            }
+            app.update();
+
+            let track_input = app.world().resource::<TrackInput>();
+            assert!(
+                track_input.blade_pressed,
+                "Expected {:?} to set track_input.blade_pressed = true",
+                key
+            );
+            let audio_events = app.world().resource::<Events<AudioTriggerEvent>>();
+            let mut reader = audio_events.get_cursor();
+            let triggered: Vec<_> = reader.read(audio_events).collect();
+            assert_eq!(triggered.len(), 1);
+            assert_eq!(
+                triggered.first().map(|e| e.kind),
+                Some(AudioSfxKind::BladeHydraulicHiss)
+            );
+        }
     }
 }
