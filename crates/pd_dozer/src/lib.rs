@@ -608,7 +608,7 @@ pub fn apply_dozer_impulse(
     *pos = sanitize_vec2(*pos + safe_n * safe_depth, *pos);
     let cur_v = sanitize_vec2(*velocity, Vec2::ZERO);
     let vn = cur_v.dot(safe_n);
-    if vn > 0.0 {
+    if vn >= 0.0 {
         return 0.0;
     }
 
@@ -844,9 +844,11 @@ pub fn compute_skid_steer_kinematics(
     .clamp(-20.0, 20.0);
     pitch = sanitize_f32(pitch + pitch_vel * safe_dt, 0.0).clamp(-PITCH_MAX, PITCH_MAX);
 
+    let steer_roll = (yaw / BASE_YAW_RATE).clamp(-1.0, 1.0) * ROLL_MAX;
+    let roll_target = sanitize_f32(ride_roll + steer_roll, 0.0).clamp(-ROLL_MAX, ROLL_MAX);
     roll_vel = sanitize_f32(
         roll_vel
-            + (CHASSIS_SPRING_STIFFNESS * (ride_roll - roll) - CHASSIS_SPRING_DAMPING * roll_vel)
+            + (CHASSIS_SPRING_STIFFNESS * (roll_target - roll) - CHASSIS_SPRING_DAMPING * roll_vel)
                 * safe_dt,
         0.0,
     )
@@ -1804,7 +1806,47 @@ mod tests {
         let coast_turning = run_speed(0.0, 1.0, 0.5, 6.0 * WORLD_UNITS_PER_METER);
         assert!(coast_turning < coast_straight - 0.5 * WORLD_UNITS_PER_METER);
 
-        // 3. Solid impact impulse pitches nose down on head-on hit and rolls hull on glancing hit
+        // Steering-driven chassis roll leans into positive/negative turns and settles when straight
+        let mut turn_left = TrackInput::from_throttle_steer(0.5, 1.0, false);
+        let mut turn_right = TrackInput::from_throttle_steer(0.5, -1.0, false);
+        for _ in 0..15 {
+            let _ = step_virtual_dozer(&mut turn_left, &upgrades, &mut stress, dt);
+            let _ = step_virtual_dozer(&mut turn_right, &upgrades, &mut stress, dt);
+        }
+        assert!(turn_left.roll > 0.008);
+        assert!(turn_right.roll < -0.008);
+        turn_left.left_track = 0.5;
+        turn_left.right_track = 0.5;
+        for _ in 0..90 {
+            let _ = step_virtual_dozer(&mut turn_left, &upgrades, &mut stress, dt);
+        }
+        assert!(turn_left.roll.abs() < 0.002);
+
+        // 3. Solid impact impulse pitches nose down on head-on hit and rolls hull on glancing hit,
+        // while tangential motion (`vn == 0.0`) skips velocity loss and impact rocking.
+        let mut tang_pos = Vec2::ZERO;
+        let orig_tang_vel = Vec2::new(6.0 * WORLD_UNITS_PER_METER, 0.0);
+        let mut tang_vel = orig_tang_vel;
+        let mut tang_pitch = 0.0_f32;
+        let mut tang_roll = 0.0_f32;
+        let mut tang_last = 0.0_f32;
+        let tang_impact = apply_dozer_impulse(
+            &mut tang_pos,
+            &mut tang_vel,
+            0.0,
+            &mut tang_pitch,
+            &mut tang_roll,
+            &mut tang_last,
+            Vec2::new(0.0, 1.0),
+            2.0,
+            0.12,
+        );
+        assert!(tang_impact.abs() < 1e-6);
+        assert_eq!(tang_vel, orig_tang_vel);
+        assert!(tang_last.abs() < 1e-6);
+        assert!(tang_pitch.abs() < 1e-6);
+        assert!(tang_roll.abs() < 1e-6);
+
         let mut pos = Vec2::ZERO;
         let mut vel = Vec2::new(6.0 * WORLD_UNITS_PER_METER, 3.0 * WORLD_UNITS_PER_METER);
         let mut pitch = 0.0_f32;
