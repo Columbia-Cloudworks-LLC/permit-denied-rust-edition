@@ -225,12 +225,21 @@ pub fn evaluate_dozer_structural_impacts_system(
     mut particle_events: EventWriter<ParticleBurstEvent>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
     mut destroyed_ids: Local<Vec<NodeIndex>>,
-    mut dozer_query: Query<(&mut PlayerVehicle, Option<&WorldPose>, &Transform), With<PlayerVehicle>>,
+    mut dozer_query: Query<
+        (
+            &mut PlayerVehicle,
+            Option<&WorldPose>,
+            &Transform,
+            Option<&Collider>,
+        ),
+        With<PlayerVehicle>,
+    >,
     mut building_query: Query<
         (
             Entity,
             Option<&WorldPose>,
             &Transform,
+            Option<&Collider>,
             &ModularBuilding,
             &mut CutawayFootprint,
             Option<&mut IsoExtrudedBox>,
@@ -251,7 +260,8 @@ pub fn evaluate_dozer_structural_impacts_system(
         ),
     >,
 ) {
-    let Ok((mut dozer_veh, dozer_pose, dozer_tf)) = dozer_query.get_single_mut() else {
+    let Ok((mut dozer_veh, dozer_pose, dozer_tf, dozer_collider)) = dozer_query.get_single_mut()
+    else {
         return;
     };
     let dozer_xy = dozer_pose.map_or_else(
@@ -262,6 +272,7 @@ pub fn evaluate_dozer_structural_impacts_system(
         || sanitize_f32(dozer_tf.rotation.to_euler(EulerRot::ZYX).0, 0.0),
         |p| sanitize_f32(p.heading_rad, 0.0),
     );
+    let dozer_rot = Rotation::radians(dozer_heading);
     let blade_down = *blade_state == BladeState::BladeDown;
     let blade_points = compute_blade_contact_points(dozer_xy, dozer_heading, blade_down);
     let push_force_mul = dozer_veh
@@ -280,50 +291,76 @@ pub fn evaluate_dozer_structural_impacts_system(
     let mut deepest_contact_normal = Vec2::Y;
 
     // 1. Evaluate building structural impacts via 5-point blade contact array & hull footprint
-    for (b_entity, b_pose, b_tf, b_meta, mut cutaway, base_box, assembly) in &mut building_query {
+    for (b_entity, b_pose, b_tf, b_collider, b_meta, mut cutaway, base_box, assembly) in
+        &mut building_query
+    {
         let b_xy = b_pose.map_or_else(
             || sanitize_vec2(b_tf.translation.truncate(), Vec2::ZERO),
             |p| sanitize_vec2(p.pos, Vec2::ZERO),
         );
+        let b_heading = b_pose.map_or_else(
+            || sanitize_f32(b_tf.rotation.to_euler(EulerRot::ZYX).0, 0.0),
+            |p| sanitize_f32(p.heading_rad, 0.0),
+        );
+        let b_rot = Rotation::radians(b_heading);
         let b_hit_radius = 85.0 + slam_bonus;
-        let min_blade_dist = blade_points
+        let blade_hit = blade_points
             .iter()
-            .map(|pt| pt.distance(b_xy))
-            .fold(f32::INFINITY, f32::min);
-        let blade_hit = min_blade_dist <= b_hit_radius;
-        let hull_dist = dozer_xy.distance(b_xy);
-        if !blade_hit && hull_dist > 95.0 {
+            .any(|pt| pt.distance_squared(b_xy) <= b_hit_radius * b_hit_radius);
+        if !blade_hit && dozer_xy.distance_squared(b_xy) > 95.0 * 95.0 {
             continue;
         }
+
+        let collider_contact = if let (Some(d_col), Some(b_col)) = (dozer_collider, b_collider) {
+            avian2d::collision::contact_query::contact(
+                d_col,
+                dozer_xy,
+                dozer_rot,
+                b_col,
+                b_xy,
+                b_rot,
+                0.0,
+            )
+            .ok()
+            .flatten()
+            .filter(|c| c.penetration > 0.0)
+        } else {
+            None
+        };
 
         destroyed_ids.clear();
         if let Some(entry) = graph_registry.buildings.get(&b_entity)
             && entry.nodes.values().any(|n| n.intact && n.story_level == 0)
         {
-            let hull_overlap = (95.0 - hull_dist).max(0.0);
-            let blade_overlap = if min_blade_dist.is_finite() {
-                (b_hit_radius - min_blade_dist).max(0.0)
-            } else {
-                0.0
-            };
-            let overlap_meters =
-                hull_overlap.max(blade_overlap) / pd_dozer::WORLD_UNITS_PER_METER;
-            if overlap_meters > max_penetration_meters {
-                let raw_dir = sanitize_vec2((dozer_xy - b_xy).normalize_or_zero(), Vec2::Y);
-                max_penetration_meters = overlap_meters;
-                deepest_contact_normal = if raw_dir.length_squared() > 1e-4 {
-                    raw_dir
-                } else {
-                    Vec2::Y
-                };
+            if let Some(contact) = collider_contact {
+                let overlap_meters =
+                    sanitize_f32(contact.penetration / pd_dozer::WORLD_UNITS_PER_METER, 0.0)
+                        .max(0.0);
+                if overlap_meters > max_penetration_meters {
+                    let raw_normal = -contact.global_normal1(&dozer_rot);
+                    let safe_normal = sanitize_vec2(raw_normal, Vec2::Y).normalize_or_zero();
+                    max_penetration_meters = overlap_meters;
+                    deepest_contact_normal = if safe_normal.length_squared() > 1e-4 {
+                        safe_normal
+                    } else {
+                        let fallback_dir =
+                            sanitize_vec2((dozer_xy - b_xy).normalize_or_zero(), Vec2::Y);
+                        if fallback_dir.length_squared() > 1e-4 {
+                            fallback_dir
+                        } else {
+                            Vec2::Y
+                        }
+                    };
+                }
             }
 
             let base_nodes = dozer_veh.consume_blade_shear_nodes(*blade_state, &upgrades);
-            let max_nodes_per_hit = if dozer_veh.crush_intersecting_block {
-                base_nodes.saturating_add(4)
-            } else {
-                base_nodes
-            };
+            let max_nodes_per_hit =
+                if dozer_veh.crush_intersecting_block && collider_contact.is_some() {
+                    base_nodes.saturating_add(4)
+                } else {
+                    base_nodes
+                };
             for (&id, node) in &entry.nodes {
                 if node.intact && node.story_level == 0 {
                     destroyed_ids.push(id);
@@ -1240,7 +1277,103 @@ mod tests {
         assert!((reset_upgrades.charge_air_kit - 1.0).abs() < 1e-5);
         assert!((reset_upgrades.aux_ram - 1.0).abs() < 1e-5);
     }
+
+    #[test]
+    fn test_watchdog_uses_true_collider_overlap_not_broad_hit_radius() {
+        AsyncComputeTaskPool::get_or_init(|| TaskPoolBuilder::new().num_threads(2).build());
+
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            StatesPlugin,
+            TransformPlugin,
+            HierarchyPlugin,
+        ))
+        .init_asset::<Image>()
+        .init_asset::<TextureAtlasLayout>()
+        .init_asset::<Mesh>()
+        .init_asset::<ColorMaterial>()
+        .init_resource::<ButtonInput<KeyCode>>()
+        .add_plugins((
+            PdCorePlugin,
+            PdWorldPlugin,
+            PdDozerPlugin,
+            PdDestructionPlugin,
+            PdAiPlugin,
+            PdUiPlugin,
+        ))
+        .add_systems(
+            Update,
+            evaluate_dozer_structural_impacts_system.after(PdSystemSet::WorldTilemapSync),
+        );
+
+        app.world_mut()
+            .resource_mut::<NextState<AppState>>()
+            .set(AppState::Playing);
+        for _ in 0..3 {
+            app.update();
+        }
+
+        // Position the dozer at (0, 0) and a single building at (0, 80):
+        // Center distance is 80 <= 95 (within broad demolition hit radius),
+        // but the 46x30 and 108x76 colliders still have a 27-unit gap along Y.
+        {
+            let mut dozer_q = app
+                .world_mut()
+                .query_filtered::<(&mut WorldPose, &mut Position), With<PlayerVehicle>>();
+            for (mut pose, mut pos) in dozer_q.iter_mut(app.world_mut()) {
+                pose.pos = Vec2::ZERO;
+                pose.heading_rad = 0.0;
+                pos.0 = Vec2::ZERO;
+            }
+
+            let mut b_q = app
+                .world_mut()
+                .query_filtered::<(Entity, &mut WorldPose, &mut Position), With<ModularBuilding>>();
+            let mut first = true;
+            for (_e, mut pose, mut pos) in b_q.iter_mut(app.world_mut()) {
+                if first {
+                    pose.pos = Vec2::new(0.0, 80.0);
+                    pos.0 = Vec2::new(0.0, 80.0);
+                    first = false;
+                } else {
+                    pose.pos = Vec2::splat(5000.0);
+                    pos.0 = Vec2::splat(5000.0);
+                }
+            }
+        }
+
+        app.update();
+        let pen_separated = app.world().resource::<TrackInput>().penetration_depth;
+        assert!(
+            pen_separated <= 1e-5,
+            "Separated colliders (27-unit gap) must report 0.0m penetration, got {pen_separated}"
+        );
+
+        // Now move the dozer to (0, 35) so the 46x30 and 108x76 colliders overlap by 8.0 units (0.50m) along Y.
+        {
+            let mut dozer_q = app
+                .world_mut()
+                .query_filtered::<(&mut WorldPose, &mut Position), With<PlayerVehicle>>();
+            for (mut pose, mut pos) in dozer_q.iter_mut(app.world_mut()) {
+                pose.pos = Vec2::new(0.0, 35.0);
+                pose.heading_rad = 0.0;
+                pos.0 = Vec2::new(0.0, 35.0);
+            }
+        }
+
+        app.update();
+        let track_in = app.world().resource::<TrackInput>();
+        assert!(
+            (track_in.penetration_depth - 0.50).abs() < 1e-3,
+            "Expected 0.50m true collider overlap, got {}",
+            track_in.penetration_depth
+        );
+        assert!(
+            track_in.contact_normal.y < -0.99,
+            "Expected recovery normal pointing along -Y away from building, got {:?}",
+            track_in.contact_normal
+        );
+    }
 }
-
-
-

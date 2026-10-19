@@ -1344,7 +1344,7 @@ pub fn fixed_dozer_kinematics_system(
     if let Some(collisions) = collisions.as_deref() {
         let dozer_rot = Rotation::radians(vehicle.heading_radians);
         for contacts in collisions.collisions_with_entity(dozer_entity) {
-            if contacts.is_sensor {
+            if contacts.is_sensor || !contacts.during_current_frame {
                 continue;
             }
             for manifold in &contacts.manifolds {
