@@ -264,6 +264,113 @@ pub struct DemolitionCashEvent {
     pub world_pos: Vec3,
 }
 
+/// Structural and debris material categories (`materials.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum MaterialKind {
+    Wood,
+    Brick,
+    #[default]
+    Concrete,
+    Steel,
+    Glass,
+}
+
+impl MaterialKind {
+    /// Default structural cell hit points (`hp`) for this material (`materials.ts`).
+    #[must_use]
+    pub const fn default_hp(self) -> f32 {
+        match self {
+            Self::Wood => 26.0,
+            Self::Brick => 40.0,
+            Self::Concrete => 62.0,
+            Self::Steel => 54.0,
+            Self::Glass => 9.0,
+        }
+    }
+
+    /// Horizontal beam span (`0..=2` cells) supported by this material before vertical drop.
+    #[must_use]
+    pub const fn beam_span(self) -> u8 {
+        match self {
+            Self::Wood => 1,
+            Self::Brick | Self::Concrete | Self::Steel => 2,
+            Self::Glass => 0,
+        }
+    }
+
+    /// Relative mass density (`materials.ts`).
+    #[must_use]
+    pub const fn density(self) -> f32 {
+        match self {
+            Self::Wood => 0.55,
+            Self::Brick => 1.05,
+            Self::Concrete => 1.35,
+            Self::Steel => 1.15,
+            Self::Glass => 0.32,
+        }
+    }
+
+    /// Fraction of resistance to blade crushing (`0.0..=1.0`, higher = easier to crush into `PileField`).
+    #[must_use]
+    pub const fn crushability(self) -> f32 {
+        match self {
+            Self::Wood => 0.82,
+            Self::Brick => 0.55,
+            Self::Concrete => 0.26,
+            Self::Steel => 0.16,
+            Self::Glass => 0.96,
+        }
+    }
+
+    /// Surface friction coefficient for debris and pile drag (`materials.ts`).
+    #[must_use]
+    pub const fn friction(self) -> f32 {
+        match self {
+            Self::Wood => 0.52,
+            Self::Brick => 0.70,
+            Self::Concrete => 0.74,
+            Self::Steel => 0.42,
+            Self::Glass => 0.22,
+        }
+    }
+
+    /// Primary intact facade color for this material.
+    #[must_use]
+    pub const fn base_color(self) -> Color {
+        match self {
+            Self::Wood => Color::srgb(0.71, 0.52, 0.33),
+            Self::Brick => Color::srgb(0.70, 0.34, 0.25),
+            Self::Concrete => Color::srgb(0.75, 0.74, 0.71),
+            Self::Steel => Color::srgb(0.54, 0.60, 0.66),
+            Self::Glass => Color::srgba(0.64, 0.84, 0.92, 0.86),
+        }
+    }
+
+    /// Cracked/stressed facade color (`hp <= 0.58 * max_hp`).
+    #[must_use]
+    pub const fn cracked_color(self) -> Color {
+        match self {
+            Self::Wood => Color::srgb(0.56, 0.40, 0.25),
+            Self::Brick => Color::srgb(0.54, 0.25, 0.19),
+            Self::Concrete => Color::srgb(0.58, 0.57, 0.54),
+            Self::Steel => Color::srgb(0.42, 0.47, 0.52),
+            Self::Glass => Color::srgba(0.76, 0.90, 0.96, 0.65),
+        }
+    }
+
+    /// Rubble/pile color for this material.
+    #[must_use]
+    pub const fn rubble_color(self) -> Color {
+        match self {
+            Self::Wood => Color::srgb(0.48, 0.35, 0.22),
+            Self::Brick => Color::srgb(0.52, 0.28, 0.22),
+            Self::Concrete => Color::srgb(0.50, 0.49, 0.46),
+            Self::Steel => Color::srgb(0.38, 0.42, 0.46),
+            Self::Glass => Color::srgb(0.58, 0.72, 0.78),
+        }
+    }
+}
+
 /// Persistent ground decal types rendered above the base isometric tilemap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DecalKind {
