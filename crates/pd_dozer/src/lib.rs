@@ -831,9 +831,9 @@ pub fn compute_skid_steer_kinematics(
     );
 
     // 7. Chassis pitch & roll spring-damper (`settleChassis` in `dozer.ts`).
-    let surge = (next_along - along) / safe_dt / DOZER_ACCEL;
+    let surge = ((next_along - along) / safe_dt / DOZER_ACCEL).clamp(-1.0, 1.0);
     let slowing = sign_i8(along) != 0 && sign_i8(surge) == -sign_i8(along);
-    let pitch_target = surge.abs().min(1.0) * if slowing { PITCH_BRAKE } else { PITCH_SQUAT };
+    let pitch_target = surge * if slowing { -PITCH_BRAKE } else { PITCH_SQUAT };
     pitch_vel = sanitize_f32(
         pitch_vel
             + (CHASSIS_SPRING_STIFFNESS * (pitch_target - pitch)
@@ -1762,6 +1762,26 @@ mod tests {
             let _ = step_virtual_dozer(&mut d, &upgrades, &mut stress, dt);
         }
         assert!(d.pitch > 0.01);
+
+        // Reverse acceleration from rest pitches nose down (`pitch > 0.008`), settles at steady
+        // reverse speed, and braking from reverse pitches rear down / nose up (`pitch < -0.01`).
+        let mut rev_d = TrackInput::from_throttle_steer(-1.0, 0.0, false);
+        for _ in 0..6 {
+            let _ = step_virtual_dozer(&mut rev_d, &upgrades, &mut stress, dt);
+        }
+        assert!(rev_d.pitch > 0.008);
+        for _ in 0..120 {
+            let _ = step_virtual_dozer(&mut rev_d, &upgrades, &mut stress, dt);
+        }
+        assert!(rev_d.pitch.abs() < 0.005);
+        assert!((rev_d.vx + BASE_MAX_REVERSE_SPEED).abs() < 0.5);
+        let fwd_cmd = TrackInput::from_throttle_steer(1.0, 0.0, false);
+        rev_d.left_track = fwd_cmd.left_track;
+        rev_d.right_track = fwd_cmd.right_track;
+        for _ in 0..6 {
+            let _ = step_virtual_dozer(&mut rev_d, &upgrades, &mut stress, dt);
+        }
+        assert!(rev_d.pitch < -0.01);
 
         // 2. Pivot turn scrubbing: turning while driving holds a lower speed than driving straight,
         // and coasting while turning sheds momentum faster than coasting straight.
