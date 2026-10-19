@@ -77,6 +77,9 @@ pub const DOZER_PUSH_COOLDOWN: f32 = 2.15;
 /// Top speed multiplier while powered blade push is active (`1.12x` in `capDozerSpeed`).
 pub const DOZER_PUSH_SPEED_CAP_MUL: f32 = 1.12;
 
+/// Sustained travel speed multiplier when the blade is held down outside the temporary powered push (`0.74x`).
+pub const DOZER_BLADE_DOWN_SPEED_DRAG: f32 = 0.74;
+
 /// Impact speed loss factor (`DOZER.impactLoss = 0.62`).
 pub const DOZER_IMPACT_LOSS: f32 = 0.62;
 
@@ -703,9 +706,9 @@ pub fn compute_skid_steer_kinematics(
         BladeState::BladeUp
     };
 
-    let (blade_shear_multiplier, blade_stress_factor) = match next_blade_state {
-        BladeState::BladeUp => (1.0_f32, 0.6_f32),
-        BladeState::BladeDown => (blade_mul, 1.45_f32),
+    let (blade_speed_drag, blade_shear_multiplier, blade_stress_factor) = match next_blade_state {
+        BladeState::BladeUp => (1.0_f32, 1.0_f32, 0.6_f32),
+        BladeState::BladeDown => (DOZER_BLADE_DOWN_SPEED_DRAG, blade_mul, 1.45_f32),
     };
 
     // 4. Update Engine Heat & Track Stress percentages.
@@ -778,12 +781,17 @@ pub fn compute_skid_steer_kinematics(
         ) + push_surge
     } else {
         let reach = 1.0 - DOZER_SCRUB_SLOW * scrub;
+        let travel_drag = if push_active_for_step && throttle > 0.0 {
+            1.0
+        } else {
+            blade_speed_drag
+        };
         let base_target = if throttle > 0.0 {
             BASE_TOP_SPEED * engine_mul * throttle.min(1.0)
         } else {
             BASE_MAX_REVERSE_SPEED * engine_mul * throttle.max(-1.0)
         };
-        let target = base_target * reach * breakdown_factor;
+        let target = base_target * reach * travel_drag * breakdown_factor;
         let scrubbing = scrub > 0.0
             && sign_i8(along) != 0
             && sign_i8(along) == sign_i8(target)
@@ -809,14 +817,14 @@ pub fn compute_skid_steer_kinematics(
 
     // 6. Cap forward or reverse top speed (`capDozerSpeed` in `dozer.ts`) from resulting travel direction.
     let max_speed = if next_along < 0.0 {
-        BASE_MAX_REVERSE_SPEED * engine_mul * breakdown_factor
+        BASE_MAX_REVERSE_SPEED * engine_mul * blade_speed_drag * breakdown_factor
     } else {
         BASE_TOP_SPEED
             * engine_mul
             * (if push_active_for_step {
                 DOZER_PUSH_SPEED_CAP_MUL
             } else {
-                1.0
+                blade_speed_drag
             })
             * breakdown_factor
     };
@@ -1691,16 +1699,42 @@ mod tests {
             assert_eq!(out2.blade_state, BladeState::BladeDown);
         }
 
-        // Drive forward while push is active: top speed can reach up to 1.12x BASE_TOP_SPEED
+        // Drive forward while push is active: top speed can reach up to 1.12x BASE_TOP_SPEED,
+        // then drops to 0.74x (DOZER_BLADE_DOWN_SPEED_DRAG) once the powered surge expires while blade remains held down.
         input.blade_pressed = true;
         let mut peak_speed = 0.0_f32;
-        for _ in 0..120 {
+        for _ in 0..80 {
             if let Ok(out) = step_virtual_dozer(&mut input, &upgrades, &mut stress, dt) {
                 peak_speed = peak_speed.max(out.linear_velocity.length());
             }
         }
         assert!(peak_speed > BASE_TOP_SPEED * 1.05);
         assert!(peak_speed <= BASE_TOP_SPEED * DOZER_PUSH_SPEED_CAP_MUL + 0.5);
+        assert_eq!(input.push_timer_secs, 0.0);
+        assert!(input.push_cooldown_secs > 0.5);
+        let sustained_blade_down_speed = Vec2::new(input.vx, input.vy).length();
+        assert!(
+            (sustained_blade_down_speed - BASE_TOP_SPEED * DOZER_BLADE_DOWN_SPEED_DRAG).abs()
+                < 0.5
+        );
+
+        // Raising the blade restores full 1.0x BASE_TOP_SPEED cruising speed
+        input.blade_pressed = false;
+        for _ in 0..60 {
+            let _ = step_virtual_dozer(&mut input, &upgrades, &mut stress, dt);
+        }
+        let blade_up_speed = Vec2::new(input.vx, input.vy).length();
+        assert!((blade_up_speed - BASE_TOP_SPEED).abs() < 0.5);
+
+        // Reverse travel with BladeDown also applies DOZER_BLADE_DOWN_SPEED_DRAG (0.74x)
+        let mut rev_down = TrackInput::from_throttle_steer(-1.0, 0.0, true);
+        rev_down.push_cooldown_secs = 2.0;
+        for _ in 0..90 {
+            let _ = step_virtual_dozer(&mut rev_down, &upgrades, &mut stress, dt);
+        }
+        assert!(
+            (rev_down.vx.abs() - BASE_MAX_REVERSE_SPEED * DOZER_BLADE_DOWN_SPEED_DRAG).abs() < 0.5
+        );
 
         // Verify Aux Ram (+35%) produces strictly higher 1-tick powered-push surge acceleration than 1.0x baseline
         let base_up = UpgradeMultipliers::default();

@@ -726,10 +726,20 @@ pub fn handle_hud_button_interactions_system(
                 }
             }
             HudButtonAction::OpenNewGameModal => {
-                next_state.set(AppState::NewGameModal);
+                if !(*app_state.get() == AppState::Paused
+                    && env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices > 0)
+                {
+                    next_state.set(AppState::NewGameModal);
+                }
             }
             HudButtonAction::ReturnToMainMenu => {
-                next_state.set(AppState::Title);
+                if !(*app_state.get() == AppState::Paused
+                    && env_config.mode == GameMode::Campaign
+                    && progression.pending_upgrade_choices > 0)
+                {
+                    next_state.set(AppState::Title);
+                }
             }
             HudButtonAction::CycleGameMode => {
                 env_config.mode = match env_config.mode {

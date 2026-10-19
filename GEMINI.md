@@ -63,7 +63,7 @@ Before marking any milestone or subsystem task complete, all three verification 
 
 Whenever the user asks to review or address feedback on a Pull Request (e.g., `"Address the feedback on this PR"`), all five of the following steps must be executed automatically (see `.agent/skills/address-pr-feedback/SKILL.md`):
 
-1. **Push Code Changes:** Implement fixes for valid feedback, verify all Rule Group E gates (`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`), and push commits to the PR branch.
+1. **Audit Diff, Implement Fixes & Push Code Changes:** Perform a Pre-Push Adversarial & Baseline-Regression Audit across the full `main...HEAD` diff (checking deleted baseline lines, sibling input/UI/kinematic paths, boundary conditions, and doc/skill alignment) so fixes resolve entire bug classes rather than narrow point-lines. Verify all Rule Group E gates (`cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace`), and push commits to the PR branch.
 2. **Reply to Addressed Feedback:** Post an in-thread reply to each addressed review comment stating **when** (commit SHA and timestamp/date) and **how** (files, functions, and mechanism) it was addressed.
 3. **Reply to Unimplemented Feedback:** Post an in-thread reply to any feedback that was ignored or not implemented explaining **why** it was not implemented.
 4. **Resolve All Review Conversations:** Resolve every addressed/replied review thread on the pull request via the GitHub GraphQL `resolveReviewThread` mutation.
