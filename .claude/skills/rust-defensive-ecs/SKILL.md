@@ -48,9 +48,18 @@ pub fn clamp_dt(raw_dt: f32) -> Result<f32, PhysicsError> {
 
 Every world reset (`Restart Site`, `New Game`, `Main Menu`) increments `SessionEpoch(pub u64)`. Any async task or deferred event stamps the `SessionEpoch` when queued and verifies it still matches — and that the target entity still exists — before mutating the world.
 
-## 4. Verification gate
+## 4. Deterministic simulation (record / replay)
 
-Pass all three gates (`CLAUDE.md` Rule Group E) before completing the task:
+Same seed + same tick-indexed inputs must reproduce a run bit for bit (CLAUDE.md Rule B):
+
+- Sim-state systems go in a `FixedUpdate` `PdSystemSet` (gated by `pd_core::sim_running`). `Update` and render systems never write sim state.
+- Randomness only from `SiteSeed` + `SplitMix64`. No wall clock, no `Entity::index()`, no `HashMap` or query-order dependence where order changes the result; sort by `SimOrdinal` (`fill_sim_order`) into a `Local` buffer.
+- Async results join on a fixed tick. Stop the sim with `SimHold` (gameplay) or `SimFreeze` (tooling), never by leaving `Playing` mid-frame.
+- Prove it: `tests/determinism.rs` and the replay MATCH tests (Gate 4).
+
+## 5. Verification gate
+
+Pass all four gates (`CLAUDE.md` Rule Group E) before completing the task:
 
 1. `cargo clippy --workspace --all-targets -- -D warnings` (Gate 1)
-2. `cargo test --workspace`, including `test_kinematic_and_ledger_extremes` (Gate 2) and `test_idempotent_site_restart` (Gate 3)
+2. `cargo test --workspace`, including `test_kinematic_and_ledger_extremes` (Gate 2), `test_idempotent_site_restart` (Gate 3) and the determinism / replay MATCH tests (Gate 4)

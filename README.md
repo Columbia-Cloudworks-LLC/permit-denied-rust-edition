@@ -61,6 +61,9 @@ cargo run
 | **Cycle Next Campaign Level (`1/7` – `7/7`)** | **`Tab`** | Click `New Game` -> `Level` |
 | **Pause / Resume Game** | **`Esc`** | Click `Pause` in Top Bar |
 | **Toggle Live Debug Telemetry Overlay** | **`F3`** | Click `Debug` in Top Bar |
+| **Toggle Collider Outlines** | **`F4`** | — |
+| **Record Playthrough (restarts the site) / Stop & Save to `scenarios/`** | **`F9`** | Any restart also stops & saves |
+| **Replay Last Recording (MATCH / DRIFT) / Exit Replay** | **`F10`** | — |
 
 ### Core Mechanics
 * **`BLADE UP` vs. `BLADE DOWN` (Timed Powered Surge & Hold):**
