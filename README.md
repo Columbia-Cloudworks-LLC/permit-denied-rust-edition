@@ -87,8 +87,8 @@ cargo run
 
 ```text
 permit-denied-bevy/
-├── GEMINI.md                   # Global Zero-Panic & ECS Scheduling Rules
-├── .agent/skills/              # On-Demand Defensive Agent Skills
+├── CLAUDE.md                   # Global Zero-Panic & ECS Scheduling Rules (Claude Code)
+├── .claude/skills/             # On-Demand Defensive Claude Code Skills
 ├── Cargo.toml                  # Workspace root + strict Clippy lints
 ├── assets/
 │   ├── atlases/                # 2.5D sprite sheets (buildings, furniture, vehicles, NPCs)
