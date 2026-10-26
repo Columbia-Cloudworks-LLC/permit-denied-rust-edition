@@ -28,5 +28,6 @@ fn main() -> AppExit {
     }));
     permit_denied::add_simulation_plugins(&mut app);
     permit_denied::add_presentation_plugins(&mut app);
+    permit_denied::add_debug_tooling_plugins(&mut app);
     app.run()
 }

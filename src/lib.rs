@@ -4,6 +4,7 @@
 
 pub mod contact_sheet;
 pub mod overlays;
+pub mod replay_hud;
 pub mod scenario_cli;
 
 use avian2d::prelude::*;
@@ -896,6 +897,16 @@ pub fn add_presentation_plugins(app: &mut App) {
                 .chain()
                 .after(PdSystemSet::HudInterpolation),
         );
+}
+
+/// Adds the in-game record/replay tooling: `pd_replay`, F9 record / F10 replay with the
+/// REC / MATCH / DRIFT badge, and the F4 isometric collider overlay.
+pub fn add_debug_tooling_plugins(app: &mut App) {
+    app.add_plugins((
+        pd_replay::PdReplayPlugin,
+        overlays::DebugOverlaysPlugin,
+        replay_hud::ReplayHudPlugin,
+    ));
 }
 
 /// Builds a windowless app running the full simulation in lockstep (exactly one 60 Hz tick per
