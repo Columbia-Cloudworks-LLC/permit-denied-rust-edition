@@ -2,6 +2,17 @@
 
 Workspace rules for the **Permit Denied** repository (`permit-denied-bevy`): a 2.5D isometric demolition sandbox on Bevy 0.15, Avian2D and `bevy_ecs_tilemap`, Rust edition 2024. Every change, crate and system must follow the six rule groups below.
 
+## Reference implementation (TypeScript)
+
+This repo is a **port**. The shipped TypeScript + Vite + PixiJS game is the reference, and this port aims for feature parity with it.
+
+- **Local path:** `D:\repos\Permit Denied` (sibling folder `../Permit Denied`; there is no local `permit-denied-game` folder). GitHub `Columbia-Cloudworks-LLC/permit-denied-game`, live at <https://permitdenied.app>.
+- **Read-only.** Never edit, commit, branch, install packages or run write-side scripts there (`npm run repo:preflight` fast-forwards and counts as a write). Reading files and `git log` / `git show` are fine.
+- **Where to look:** its `README.md` is the source of truth for controls, scope and copy. Then `CLAUDE.md`, `docs/architecture.md` (cells, roofs, debris layers), `docs/campaign.md` (Time Challenge levels, targets, clocks), `docs/city-map-fabric.md` (urban bands), `docs/testing.md` (test tiers, recorded playthroughs). Behaviour lives in `src/sim/`, `src/structure/`, `src/world/`, `src/game/`, `src/vehicle/`; tuning constants in `src/game/constants.ts` and `src/game/campaign.ts`; building, site and vehicle JSON under `src/world/data/`.
+- **Parity tracking:** [`docs/parity.md`](docs/parity.md) lists every area as Done / Partial / Missing / Different-by-design. Update the row when a change closes or opens a gap.
+- **When they disagree:** match the reference's player-visible behaviour, numbers and copy unless `docs/parity.md` marks the item Different-by-design. The Rust architecture (Bevy ECS, crate DAG, Avian2D, zero-panic rules above) is deliberately different and is not a parity gap. The reference's "no ECS" stack lock applies only to that repo.
+- **Copy rules carried over:** `BLADE UP` / `BLADE DOWN`; run-ending states `ENGINE COOKED` / `TRACK THROWN` / `COUNTY CLOCK`; title `PERMIT DENIED`, tagline "The County Said No." Never write Heemeyer, Granby, manifesto or wanted stars.
+
 ## Commands
 
 ```bash
