@@ -327,6 +327,34 @@ pub struct SimHold(pub bool);
 pub enum SiteTestMap {
     #[default]
     Standard,
+    /// The reference's canonical demolition benchmark (`?sandbox=1&ranch=1`): one 5x3-cell,
+    /// single-floor timber ranch with a gable roof, no traffic or pedestrians, and the dozer
+    /// staged 3.4 m off the south facade facing it (`ranchLever.ts`).
+    Ranch,
+}
+
+/// World-space center of the ranch benchmark building.
+pub const RANCH_SITE_ORIGIN: Vec2 = Vec2::new(0.0, 80.0);
+
+impl SiteTestMap {
+    /// Dozer spawn `(world_xy, heading_rad)` for this map.
+    #[must_use]
+    pub fn dozer_spawn(self) -> (Vec2, f32) {
+        match self {
+            Self::Standard => (Vec2::new(0.0, -60.0), 0.0),
+            // South facade sits at origin.y - 15 - 8 = 57; 3.4 m * 16 units/m = 54.4 back.
+            Self::Ranch => (
+                Vec2::new(RANCH_SITE_ORIGIN.x, RANCH_SITE_ORIGIN.y - 23.0 - 54.4),
+                std::f32::consts::FRAC_PI_2,
+            ),
+        }
+    }
+
+    /// Whether the site spawns ambient pedestrians and road traffic.
+    #[must_use]
+    pub const fn has_ambient_agents(self) -> bool {
+        matches!(self, Self::Standard)
+    }
 }
 
 /// Tooling freeze between ticks (replay end, capture ticks, debug stepping). Separate from

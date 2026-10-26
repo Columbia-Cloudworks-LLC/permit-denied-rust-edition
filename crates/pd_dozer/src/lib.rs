@@ -13,6 +13,7 @@ use pd_core::{
     DecalKind, DecalSpawnRequest, EnvironmentConfig, GameMode, ISO_BIAS_DOZER, InputAuthority,
     IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind,
     PdSystemSet, PhysicsError, SessionEpoch, SimHold, SimTick, SiteRestartRequested, SiteScoped,
+    SiteTestMap,
     WorldPose, heading_offset, iso_depth_key, sanitize_dt, sanitize_f32, sanitize_vec2,
     world_to_iso_screen,
 };
@@ -1098,13 +1099,14 @@ pub fn ensure_player_dozer_spawned_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
     blade_state: Res<BladeState>,
+    test_map: Option<Res<SiteTestMap>>,
     existing_dozer: Query<Entity, With<PlayerVehicle>>,
 ) {
     if existing_dozer.iter().next().is_some() {
         return;
     }
 
-    let spawn_world_xy = Vec2::new(0.0, -60.0);
+    let (spawn_world_xy, spawn_heading) = test_map.map_or(SiteTestMap::Standard, |m| *m).dozer_spawn();
     let spawn_iso = world_to_iso_screen(spawn_world_xy, 0.0);
     let spawn_z = iso_depth_key(spawn_world_xy, 0.0, ISO_BIAS_DOZER);
     let (base_hull, assembly) = build_dozer_iso_assembly(*blade_state);
@@ -1112,9 +1114,12 @@ pub fn ensure_player_dozer_spawned_system(
     commands
         .spawn((
             Name::new("Armored Dozer (PlayerVehicle)"),
-            PlayerVehicle::default(),
+            PlayerVehicle {
+                heading_radians: spawn_heading,
+                ..Default::default()
+            },
             SiteScoped { epoch: *epoch },
-            WorldPose::new(spawn_world_xy, 0.0, 0.0),
+            WorldPose::new(spawn_world_xy, 0.0, spawn_heading),
             IsoLayerBias(ISO_BIAS_DOZER),
             base_hull,
             assembly,
@@ -1125,7 +1130,7 @@ pub fn ensure_player_dozer_spawned_system(
                 RigidBody::Dynamic,
                 Collider::rectangle(46.0, 30.0),
                 Position(spawn_world_xy),
-                Rotation::radians(0.0),
+                Rotation::radians(spawn_heading),
                 LinearVelocity::default(),
                 AngularVelocity::default(),
             ),

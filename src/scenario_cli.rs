@@ -171,7 +171,18 @@ fn finish_outputs(
         let mut updated = scenario.clone();
         updated.expect = Some(result.digest.clone());
         updated.build = pd_replay::build_id();
-        updated.save(&args.scenario).map_err(|e| e.to_string())?;
+        // Keep the file's leading `//` comment block; RON serialization drops comments.
+        let header: String = std::fs::read_to_string(&args.scenario)
+            .unwrap_or_default()
+            .lines()
+            .take_while(|l| l.trim_start().starts_with("//"))
+            .map(|l| format!("{l}
+"))
+            .collect();
+        let body = updated.to_ron_string().map_err(|e| e.to_string())?;
+        std::fs::write(&args.scenario, format!("{header}{body}
+"))
+            .map_err(|e| format!("{}: {e}", args.scenario.display()))?;
         println!("wrote expected digest to {}", args.scenario.display());
     }
     println!(
@@ -281,11 +292,31 @@ fn run_windowed(scenario: Scenario, args: CliArgs, out_dir: PathBuf) -> AppExit 
         })
         .add_systems(
             Update,
-            (start_scenario_once_system, drive_screenshot_captures_system)
+            (
+                start_scenario_once_system,
+                apply_capture_zoom_system,
+                drive_screenshot_captures_system,
+            )
                 .chain()
                 .after(pd_replay::replay_boundary_update_system),
         );
     app.run()
+}
+
+/// Applies `overlays.zoom` to the isometric camera (presentation only).
+fn apply_capture_zoom_system(
+    run: Res<ScenarioRun>,
+    mut cameras: Query<&mut OrthographicProjection, With<crate::IsometricCamera>>,
+) {
+    let Some(zoom) = run.scenario.overlays.zoom else {
+        return;
+    };
+    let scale = 1.0 / zoom.clamp(0.25, 8.0);
+    for mut projection in &mut cameras {
+        if (projection.scale - scale).abs() > f32::EPSILON {
+            projection.scale = scale;
+        }
+    }
 }
 
 fn start_scenario_once_system(world: &mut World) {

@@ -809,9 +809,12 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
     epoch: Res<SessionEpoch>,
     env_config: Res<EnvironmentConfig>,
     road_graph: Res<RoadSplineGraph>,
+    test_map: Option<Res<pd_core::SiteTestMap>>,
     existing_agents: Query<Entity, With<AgentState>>,
 ) {
-    if existing_agents.iter().next().is_some() {
+    if existing_agents.iter().next().is_some()
+        || test_map.is_some_and(|m| !m.has_ambient_agents())
+    {
         return;
     }
 

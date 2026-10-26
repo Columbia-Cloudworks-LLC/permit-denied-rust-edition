@@ -1,3 +1,5 @@
+// Smoke scenario: pivot toward building #0 on the City Borough block, ram it blade-down,
+// back off and hit it again. Exercises collapse BFS, debris and the PileField.
 (
     format: "permit-denied-scenario",
     version: 1,

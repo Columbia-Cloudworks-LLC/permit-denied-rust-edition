@@ -65,8 +65,8 @@ pub struct CaptureSpec {
     pub label: String,
 }
 
-/// Debug overlays shown during a scenario run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Debug overlays and capture framing for a scenario run (presentation only).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Overlays {
     /// F3 telemetry panel.
     #[serde(default)]
@@ -74,6 +74,9 @@ pub struct Overlays {
     /// Avian2D collider outlines projected into the isometric view (F4).
     #[serde(default)]
     pub colliders: bool,
+    /// Capture camera zoom (`2.0` = twice as close, range `0.25..=8.0`). Never affects the sim.
+    #[serde(default)]
+    pub zoom: Option<f32>,
 }
 
 /// Session setup that rebuilds the site.
@@ -251,6 +254,13 @@ impl Scenario {
                 "capture {:?} at tick {} is after exit_tick {}",
                 bad.label, bad.tick, self.exit_tick
             )));
+        }
+        if self
+            .overlays
+            .zoom
+            .is_some_and(|z| !z.is_finite() || !(0.25..=8.0).contains(&z))
+        {
+            return Err(ScenarioError::Invalid("overlays.zoom must be within 0.25..=8.0".to_string()));
         }
         let u = self.settings.upgrades;
         if !(u.ar400_edge.is_finite() && u.charge_air_kit.is_finite() && u.aux_ram.is_finite()) {

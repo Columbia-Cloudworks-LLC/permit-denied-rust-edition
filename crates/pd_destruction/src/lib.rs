@@ -16,8 +16,8 @@ use pd_core::{
     DebugTelemetry, DecalKind, DecalSpawnRequest, DemolitionCashEvent, EnvironmentConfig,
     ISO_BIAS_BUILDING, ISO_BIAS_DEBRIS, ISO_BIAS_INTERIOR_FLOOR, ISO_BIAS_PROP, IsoBoxAssembly,
     IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind, PdSystemSet,
-    RoofSlopeSpec, SIM_ORDINAL_DEBRIS_BASE, SIM_ORDINAL_PROP_BASE, SessionEpoch, SimOrdinal,
-    SimTick, SiteRestartRequested, SiteScoped, WorldPose, iso_depth_key,
+    RANCH_SITE_ORIGIN, RoofSlopeSpec, SIM_ORDINAL_DEBRIS_BASE, SIM_ORDINAL_PROP_BASE, SessionEpoch, SimOrdinal,
+    SimTick, SiteRestartRequested, SiteTestMap, SiteScoped, WorldPose, iso_depth_key,
     sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
 };
 use pd_world::{
@@ -1390,8 +1390,16 @@ pub struct ModularBuilding {
 /// Helper that generates a multi-story modular building graph with spatial cell bounds and material HP (`Issue #14`).
 #[must_use]
 pub fn build_procedural_building_graph(stories: u8, footprint_half: i32) -> Vec<StructuralNode> {
+    build_rect_building_graph(stories, footprint_half, footprint_half)
+}
+
+/// Rectangular variant of [`build_procedural_building_graph`]: `(2 * half_x + 1)` by
+/// `(2 * half_y + 1)` cells per story (e.g. the 5x3 ranch is `half_x = 2, half_y = 1`).
+#[must_use]
+pub fn build_rect_building_graph(stories: u8, half_x: i32, half_y: i32) -> Vec<StructuralNode> {
     let clamped_stories = stories.clamp(1, 8);
-    let half = footprint_half.clamp(1, 4);
+    let half_x = half_x.clamp(1, 4);
+    let half_y = half_y.clamp(1, 4);
     let mut nodes = Vec::new();
     let mut coord_to_id: HashMap<(i32, i32, u8), NodeIndex> = HashMap::new();
 
@@ -1410,10 +1418,10 @@ pub fn build_procedural_building_graph(stories: u8, footprint_half: i32) -> Vec<
 
     let mut next_id: NodeIndex = 0;
     for story in 0..clamped_stories {
-        for gy in -half..=half {
-            for gx in -half..=half {
-                let is_perimeter = gx.abs() == half || gy.abs() == half;
-                let is_corner = gx.abs() == half && gy.abs() == half;
+        for gy in -half_y..=half_y {
+            for gx in -half_x..=half_x {
+                let is_perimeter = gx.abs() == half_x || gy.abs() == half_y;
+                let is_corner = gx.abs() == half_x && gy.abs() == half_y;
                 let kind = if story == clamped_stories - 1 && !is_perimeter {
                     StructuralModuleKind::RoofCorrugation
                 } else if is_corner {
@@ -2908,6 +2916,7 @@ pub fn ensure_site_buildings_spawned_system(
     manifest: Res<CampaignPrefabsManifest>,
     _atlas: Res<ProceduralWorldAtlas>,
     mut graph_registry: ResMut<BuildingGraphRegistry>,
+    test_map: Option<Res<SiteTestMap>>,
     existing_buildings: Query<Entity, With<ModularBuilding>>,
 ) {
     if existing_buildings.iter().next().is_some() {
@@ -2915,6 +2924,10 @@ pub fn ensure_site_buildings_spawned_system(
     }
 
     graph_registry.current_epoch = *epoch;
+    if test_map.is_some_and(|m| *m == SiteTestMap::Ranch) {
+        spawn_ranch_benchmark_site(&mut commands, *epoch, &mut graph_registry);
+        return;
+    }
     let level_idx = env_config.level.index_one_based();
     let stories = manifest
         .entry_for_level(env_config.level)
@@ -3071,6 +3084,98 @@ pub fn ensure_site_buildings_spawned_system(
             Visibility::default(),
         ));
     }
+}
+
+/// Ranch benchmark ([`SiteTestMap::Ranch`]), hand-built from the reference's
+/// `residential/ranch/main.building.json`: 5x3 cells, one floor, timber walls and posts, gable
+/// roof along x (three West/Center/East bays), with kitchen / living / bath fixtures inside.
+/// The reference's chimney and south door opening are not modeled (no such modules yet).
+pub fn spawn_ranch_benchmark_site(
+    commands: &mut Commands,
+    epoch: SessionEpoch,
+    graph_registry: &mut BuildingGraphRegistry,
+) {
+    let origin = RANCH_SITE_ORIGIN;
+    let mut nodes = build_rect_building_graph(1, 2, 1);
+    for node in &mut nodes {
+        if node.kind == StructuralModuleKind::LoadBearingPillar {
+            // Timber house: corner posts are wood, not the procedural brick piers.
+            node.material = MaterialKind::Wood;
+            node.facade_material = MaterialKind::Wood;
+            node.hp = MaterialKind::Wood.default_hp();
+            node.max_hp = node.hp;
+        }
+    }
+
+    let floor_iso = world_to_iso_screen(origin, 0.5);
+    commands.spawn((
+        Name::new("Ranch Interior Flooring"),
+        SiteScoped { epoch },
+        WorldPose::new(origin, 0.5, 0.0),
+        IsoLayerBias(ISO_BIAS_INTERIOR_FLOOR),
+        IsoExtrudedBox::new(104.0, 44.0, 1.8, Color::srgb(0.80, 0.70, 0.55)).with_shadow(false),
+        Transform::from_xyz(floor_iso.x, floor_iso.y, iso_depth_key(origin, 0.5, ISO_BIAS_INTERIOR_FLOOR)),
+        GlobalTransform::default(),
+        Visibility::default(),
+    ));
+
+    // Kitchen (west), living (center), bath (east), as in main.layout.json.
+    let fixtures = [
+        (PropArchetype::Refrigerator, Vec2::new(-38.0, 6.0)),
+        (PropArchetype::Couch, Vec2::new(0.0, 8.0)),
+        (PropArchetype::Toilet, Vec2::new(38.0, 4.0)),
+    ];
+    for (i, (arch, local)) in fixtures.into_iter().enumerate() {
+        let pos = origin + local;
+        let (prop_base, prop_asm) = build_prop_iso_assembly(arch);
+        let iso = world_to_iso_screen(pos, 2.0);
+        commands.spawn((
+            Name::new(format!("Ranch Fixture ({arch:?})")),
+            SiteScoped { epoch },
+            SimOrdinal(SIM_ORDINAL_PROP_BASE.saturating_add(i as u64)),
+            DestructibleProp::new(arch, true),
+            WorldPose::new(pos, 2.0, 0.0),
+            IsoLayerBias(ISO_BIAS_PROP),
+            prop_base,
+            prop_asm,
+            Transform::from_xyz(iso.x, iso.y, iso_depth_key(pos, 2.0, ISO_BIAS_PROP)),
+            GlobalTransform::default(),
+            Visibility::default(),
+        ));
+    }
+
+    let entry = BuildingGraphEntry::new(epoch, nodes).with_site_ordinal(0);
+    let (b_base, b_asm) = build_building_iso_assembly_from_entry(&entry, 1, 0);
+    let collider = build_building_compound_collider(&entry.nodes)
+        .unwrap_or_else(|| Collider::rectangle(108.0, 46.0));
+    let b_iso = world_to_iso_screen(origin, 0.0);
+    let b_entity = commands
+        .spawn((
+            Name::new("Ranch (benchmark)"),
+            SiteScoped { epoch },
+            SimOrdinal(0),
+            ModularBuilding {
+                archetype_name: "RANCH".to_string(),
+                stories: 1,
+                palette_index: 0,
+            },
+            CutawayFootprint {
+                min_world: origin - Vec2::new(60.0, 32.0),
+                max_world: origin + Vec2::new(60.0, 32.0),
+                exterior_breached: false,
+                current_roof_alpha: 1.0,
+            },
+            WorldPose::new(origin, 0.0, 0.0),
+            IsoLayerBias(ISO_BIAS_BUILDING),
+            b_base,
+            b_asm,
+            Transform::from_xyz(b_iso.x, b_iso.y, iso_depth_key(origin, 16.0, ISO_BIAS_BUILDING)),
+            GlobalTransform::default(),
+            Visibility::default(),
+            (Position(origin), Rotation::IDENTITY, RigidBody::Static, collider),
+        ))
+        .id();
+    graph_registry.buildings.insert(b_entity, entry);
 }
 
 /// Resets `BuildingGraphRegistry` and `DebrisPoolRegistry` on `SiteRestartRequested`.

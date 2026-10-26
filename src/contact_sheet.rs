@@ -164,10 +164,16 @@ pub fn compose_contact_sheet(title: &str, frames: &[SheetFrame], layout: SheetLa
         let x = layout.gutter + (idx % columns) * cell_w;
         let y = title_h + (idx / columns) * cell_h;
         fill(&mut sheet, x, y, thumb_w, caption_h, CAPTION_BG);
-        let pad = (caption_h - GLYPH_H * scale) / 2;
-        let max_chars = (thumb_w.saturating_sub(2 * pad) / ((GLYPH_W + 1) * scale)) as usize;
+        // Step the font down for long captions before truncating them.
+        let avail = thumb_w.saturating_sub(2 * GLYPH_H);
+        let fit = (1..=scale)
+            .rev()
+            .find(|s| text_width(&frame.caption, *s) <= avail)
+            .unwrap_or(1);
+        let pad = (caption_h - GLYPH_H * fit) / 2;
+        let max_chars = (thumb_w.saturating_sub(2 * pad) / ((GLYPH_W + 1) * fit)) as usize;
         let caption: String = frame.caption.chars().take(max_chars).collect();
-        draw_text(&mut sheet, x + pad, y + pad, &caption, scale, TEXT);
+        draw_text(&mut sheet, x + pad, y + pad, &caption, fit, TEXT);
         let thumb = imageops::resize(&frame.image, thumb_w, thumb_h, imageops::FilterType::Triangle);
         imageops::overlay(&mut sheet, &thumb, i64::from(x), i64::from(y + caption_h));
     }
