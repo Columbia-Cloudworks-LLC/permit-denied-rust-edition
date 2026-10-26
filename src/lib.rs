@@ -2,6 +2,10 @@
 //! (`pd_core`, `pd_world`, `pd_dozer`, `pd_destruction`, `pd_ai`, `pd_ui`), procedural WAV
 //! audio synthesis, 3-tier debris heightmap crushing, prop destruction, and Verification Gates.
 
+pub mod contact_sheet;
+pub mod overlays;
+pub mod scenario_cli;
+
 use avian2d::prelude::*;
 use bevy::audio::AudioPlayer;
 use bevy::prelude::*;
@@ -828,9 +832,10 @@ pub fn gate_physics_clock_on_sim_running_system(
     state: Option<Res<State<AppState>>>,
     hold: Option<Res<pd_core::SimHold>>,
     restart_gate: Option<Res<pd_core::RestartGate>>,
+    freeze: Option<Res<pd_core::SimFreeze>>,
     mut physics_time: ResMut<Time<Physics>>,
 ) {
-    let running = pd_core::sim_running(state, hold, restart_gate);
+    let running = pd_core::sim_running(state, hold, restart_gate, freeze);
     if running && physics_time.is_paused() {
         physics_time.unpause();
     } else if !running && !physics_time.is_paused() {

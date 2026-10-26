@@ -321,6 +321,19 @@ pub struct SimTick(pub u64);
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SimHold(pub bool);
 
+/// Which site layout `Restart Site` builds. `Standard` is the level's procedural block; the
+/// others are fixed benchmark sites used by scenarios.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum SiteTestMap {
+    #[default]
+    Standard,
+}
+
+/// Tooling freeze between ticks (replay end, capture ticks, debug stepping). Separate from
+/// [`SimHold`] so gameplay (the Campaign modal) never releases a freeze it did not set.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimFreeze(pub bool);
+
 /// Who drives the dozer and upgrade picks. Live keyboard/HUD input is ignored under `Replay`.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputAuthority {
@@ -335,10 +348,12 @@ pub fn sim_running(
     state: Option<Res<State<AppState>>>,
     hold: Option<Res<SimHold>>,
     gate: Option<Res<RestartGate>>,
+    freeze: Option<Res<SimFreeze>>,
 ) -> bool {
     state.is_some_and(|s| *s.get() == AppState::Playing)
         && !hold.is_some_and(|h| h.0)
         && !gate.is_some_and(|g| g.pending())
+        && !freeze.is_some_and(|f| f.0)
 }
 
 /// Stable per-site ordering key for simulation entities (buildings, props, debris).
@@ -1251,6 +1266,8 @@ impl Plugin for PdCorePlugin {
             .init_resource::<SimTick>()
             .init_resource::<SimHold>()
             .init_resource::<RestartGate>()
+            .init_resource::<SimFreeze>()
+            .init_resource::<SiteTestMap>()
             .init_resource::<InputAuthority>()
             .insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
             .insert_resource(DebugTelemetry {
