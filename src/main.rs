@@ -767,6 +767,37 @@ pub fn evaluate_dozer_structural_impacts_system(
     }
 }
 
+/// Freezes the Avian2D clock whenever the simulation is not `Playing`.
+///
+/// Gameplay systems are gated by `in_state(AppState::Playing)`, but Avian steps in
+/// `FixedPostUpdate` regardless of `AppState`. Without this gate, bodies keep integrating their
+/// last velocity through Pause, the upgrade modal and the Title screen, for as many ticks as the
+/// wall-clock pause lasted. Runs after `StateTransition`, before the fixed loop of the same frame.
+pub fn gate_physics_clock_on_app_state_system(
+    state: Res<State<AppState>>,
+    mut physics_time: ResMut<Time<Physics>>,
+) {
+    let playing = *state.get() == AppState::Playing;
+    if playing && physics_time.is_paused() {
+        physics_time.unpause();
+    } else if !playing && !physics_time.is_paused() {
+        physics_time.pause();
+    }
+}
+
+/// Registers [`gate_physics_clock_on_app_state_system`] ahead of the fixed main loop.
+pub struct PhysicsStateGatePlugin;
+
+impl Plugin for PhysicsStateGatePlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(
+            RunFixedMainLoop,
+            gate_physics_clock_on_app_state_system
+                .in_set(bevy::app::RunFixedMainLoopSystem::BeforeFixedMainLoop),
+        );
+    }
+}
+
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -781,6 +812,7 @@ fn main() {
         }))
         .add_plugins(PhysicsPlugins::default().with_length_unit(16.0))
         .insert_resource(Gravity(Vec2::ZERO))
+        .add_plugins(PhysicsStateGatePlugin)
         .init_resource::<SynthesizedAudioBank>()
         .add_plugins((
             PdCorePlugin,
@@ -1827,6 +1859,67 @@ mod tests {
                 .get::<pd_world::CollapsedSite>()
                 .is_some(),
             "Building at >=90% settled destruction must gain CollapsedSite component"
+        );
+    }
+
+    /// Regression for the Avian-while-paused leak: a moving body must not advance while
+    /// `AppState` is anything other than `Playing`, and must resume once it is.
+    #[test]
+    fn test_physics_clock_frozen_outside_playing() {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            bevy::scene::ScenePlugin,
+            StatesPlugin,
+            TransformPlugin,
+            HierarchyPlugin,
+            bevy::diagnostic::DiagnosticsPlugin,
+        ))
+        .init_asset::<Mesh>()
+        .add_plugins(PhysicsPlugins::default().with_length_unit(16.0))
+            .insert_resource(Gravity(Vec2::ZERO))
+            .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+                std::time::Duration::from_millis(16),
+            ))
+            .init_state::<AppState>()
+            .add_plugins(PhysicsStateGatePlugin);
+
+        let body = app
+            .world_mut()
+            .spawn((
+                RigidBody::Dynamic,
+                Collider::circle(4.0),
+                Position(Vec2::ZERO),
+                LinearVelocity(Vec2::new(100.0, 0.0)),
+            ))
+            .id();
+
+        let x_of = |app: &App| app.world().get::<Position>(body).map_or(f32::NAN, |p| p.0.x);
+
+        // Title (default state): the body must stay put.
+        for _ in 0..20 {
+            app.update();
+        }
+        assert!(x_of(&app).abs() < 1e-4, "body moved during Title: x = {}", x_of(&app));
+
+        app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Playing);
+        for _ in 0..20 {
+            app.update();
+        }
+        let after_play = x_of(&app);
+        assert!(after_play > 1.0, "body must move while Playing: x = {after_play}");
+
+        app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
+        app.update();
+        let paused_at = x_of(&app);
+        for _ in 0..30 {
+            app.update();
+        }
+        assert!(
+            (x_of(&app) - paused_at).abs() < 1e-4,
+            "body drifted while Paused: {paused_at} -> {}",
+            x_of(&app)
         );
     }
 }
