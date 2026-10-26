@@ -1194,24 +1194,38 @@ pub fn read_dozer_keyboard_input_system(
         turn -= 1.0;
     }
 
-    // Preserve full throttle + steer when driving and turning simultaneously
-    let mut left = (forward - turn).clamp(-2.0, 2.0);
-    let mut right = (forward + turn).clamp(-2.0, 2.0);
+    // Tracks as the player sees them on screen. Preserve full throttle + steer when driving
+    // and turning simultaneously: A slows the screen-left track and speeds the screen-right.
+    let mut screen_left = (forward - turn).clamp(-2.0, 2.0);
+    let mut screen_right = (forward + turn).clamp(-2.0, 2.0);
 
-    // Direct independent track overrides (Q/Z left track, E/C right track)
+    // Direct independent track overrides (Q/Z screen-left track, E/C screen-right track)
     if keys.pressed(KeyCode::KeyQ) {
-        left = 1.0;
+        screen_left = 1.0;
     } else if keys.pressed(KeyCode::KeyZ) {
-        left = -1.0;
+        screen_left = -1.0;
     }
     if keys.pressed(KeyCode::KeyE) {
-        right = 1.0;
+        screen_right = 1.0;
     } else if keys.pressed(KeyCode::KeyC) {
-        right = -1.0;
+        screen_right = -1.0;
     }
 
+    let (left, right) = screen_tracks_to_world_tracks(screen_left, screen_right);
     live.left_track = left;
     live.right_track = right;
+}
+
+/// Converts on-screen track commands into the simulation's world-space `(left, right)` tracks.
+///
+/// `world_to_iso_screen` is orientation-reversing (world +X -> screen (1, -0.5), +Y -> (-1, -0.5),
+/// determinant < 0), so the render is a mirror image of world space: the dozer's world-left track
+/// is drawn on the screen-right side, and a counter-clockwise world turn reads as clockwise on
+/// screen. Swapping the tracks makes A / Left (and Q/Z) turn the dozer left as seen on screen,
+/// matching the reference, where A gives `steer = -1` and the heading decreases.
+#[must_use]
+pub const fn screen_tracks_to_world_tracks(screen_left: f32, screen_right: f32) -> (f32, f32) {
+    (screen_right, screen_left)
 }
 
 /// Drive control requested by the player this frame (keyboard), latched into [`TrackInput`]
@@ -2176,6 +2190,49 @@ mod tests {
         // In Sandbox mode, upgrades can be applied immediately without pending milestones
         assert!(prog.try_apply_choice(&mut upgrades, GameMode::Sandbox, UpgradeChoice::AuxRam));
         assert!((upgrades.aux_ram - 1.35).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_steering_keys_turn_the_dozer_the_way_they_read_on_screen() {
+        // +1 = counter-clockwise on screen (a left turn), -1 = clockwise (a right turn).
+        fn screen_turn_sign(keys_down: &[KeyCode]) -> f32 {
+            let mut app = App::new();
+            app.add_plugins(MinimalPlugins)
+                .init_resource::<ButtonInput<KeyCode>>()
+                .init_resource::<TrackInput>()
+                .init_resource::<LiveDriveControl>()
+                .init_resource::<InputAuthority>()
+                .add_event::<AudioTriggerEvent>()
+                .add_systems(
+                    Update,
+                    (read_dozer_keyboard_input_system, latch_drive_control_system).chain(),
+                );
+            {
+                let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+                for &key in keys_down {
+                    keys.press(key);
+                }
+            }
+            app.update();
+
+            let mut input = *app.world().resource::<TrackInput>();
+            let upgrades = UpgradeMultipliers::default();
+            let mut stress = MechanicalStress::default();
+            for _ in 0..20 {
+                let _ = step_virtual_dozer(&mut input, &upgrades, &mut stress, 1.0 / 60.0);
+            }
+            let before = world_to_iso_screen(Vec2::X, 0.0);
+            let after = world_to_iso_screen(Vec2::from_angle(input.heading_radians), 0.0);
+            (before.x * after.y - before.y * after.x).signum()
+        }
+
+        assert!((screen_turn_sign(&[KeyCode::KeyA]) - 1.0).abs() < f32::EPSILON, "A turns left");
+        assert!((screen_turn_sign(&[KeyCode::ArrowLeft]) - 1.0).abs() < f32::EPSILON, "Left turns left");
+        assert!((screen_turn_sign(&[KeyCode::KeyD]) + 1.0).abs() < f32::EPSILON, "D turns right");
+        assert!((screen_turn_sign(&[KeyCode::KeyW, KeyCode::KeyA]) - 1.0).abs() < f32::EPSILON, "W+A arcs left");
+        // Screen-left track forward pivots right; screen-right track forward pivots left.
+        assert!((screen_turn_sign(&[KeyCode::KeyQ]) + 1.0).abs() < f32::EPSILON, "Q pivots right");
+        assert!((screen_turn_sign(&[KeyCode::KeyE]) - 1.0).abs() < f32::EPSILON, "E pivots left");
     }
 
     #[test]

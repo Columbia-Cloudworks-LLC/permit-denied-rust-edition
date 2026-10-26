@@ -20,7 +20,9 @@ fn live_keys(tick: u64) -> LiveDriveControl {
     let (left_track, right_track, blade_pressed) = match tick {
         0..150 => (1.0, 1.0, false),
         150..170 => (1.0, 1.0, true),
-        170..210 => (0.0, 2.0, false),
+        // W+A: world-space tracks, so the screen-left turn is left = 2, right = 0
+        // (see `pd_dozer::screen_tracks_to_world_tracks`).
+        170..210 => (2.0, 0.0, false),
         210..270 => (1.0, 1.0, false),
         _ => (0.0, 0.0, false),
     };

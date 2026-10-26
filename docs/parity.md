@@ -52,7 +52,7 @@ The port has a solid core loop. The dozer drives with blade surge, upgrades, hea
 
 | Item | Status | Note | TS | Rust |
 | --- | --- | --- | --- | --- |
-| Throttle and steer drive (W/S, A/D, arrows) | Done | Momentum, lateral grip, speed-falloff steering, turn scrub. Constants mirror the reference. | `TS:src/vehicle/dozer.ts` | `pd_dozer::compute_skid_steer_kinematics` |
+| Throttle and steer drive (W/S, A/D, arrows) | Done | Momentum, lateral grip, speed-falloff steering, turn scrub. Constants mirror the reference. A/D (and Q/Z/E/C) were reversed on screen until `screen_tracks_to_world_tracks` corrected for the mirrored isometric projection. A now decreases the heading, as in the reference. | `TS:src/vehicle/dozer.ts` | `pd_dozer::compute_skid_steer_kinematics` |
 | Powered blade surge (0.72 s, 1.12× cap, 2.15 s cooldown, 0.74× drag) | Done | `test_issue_11_timed_powered_blade_surge_and_5_blade_points`. | `TS:src/vehicle/dozer.ts` | `pd_dozer::DOZER_PUSH_*` |
 | 5-point blade contact and blade-slam bonus | Done | | `TS:src/sim/coreImpact.ts` | `pd_dozer::compute_blade_contact_points`, `src/lib.rs` (`slam_bonus`) |
 | Chassis pitch and roll spring-damper | Partial | Pitch and roll kicks exist. The reference's 1.0.48–1.0.49 dozer roll, continuous tread scrub and heft-scaled camera shake landed after this port's baseline. | `TS:src/vehicle/dozer.ts`, `TS:src/fx/cameraShake.ts` | `pd_dozer::kick_chassis` |
