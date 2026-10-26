@@ -820,6 +820,10 @@ pub fn evaluate_dozer_structural_impacts_system(
 /// integrating their last velocity through Pause, the upgrade modal and the Title screen, for
 /// as many ticks as the wall-clock pause lasted. Runs in `FixedFirst`, so a hold raised during
 /// tick `k` still lets tick `k` finish its physics step and stops every later tick.
+///
+/// Pausing also zeroes the clock's delta: Avian 0.2's `run_physics_schedule` decides whether to
+/// step from `Time<Physics>::delta()` *before* it resets a paused clock's delta, so a bare
+/// `pause()` would still run one more full step on the first paused tick.
 pub fn gate_physics_clock_on_sim_running_system(
     state: Option<Res<State<AppState>>>,
     hold: Option<Res<pd_core::SimHold>>,
@@ -831,6 +835,7 @@ pub fn gate_physics_clock_on_sim_running_system(
         physics_time.unpause();
     } else if !running && !physics_time.is_paused() {
         physics_time.pause();
+        physics_time.advance_by(std::time::Duration::ZERO);
     }
 }
 
@@ -1987,16 +1992,15 @@ mod tests {
         let after_play = x_of(&app);
         assert!(after_play > 1.0, "body must move while Playing: x = {after_play}");
 
+        // The very first paused tick must not step either (Avian 0.2 checks the stale delta).
         app.world_mut().resource_mut::<NextState<AppState>>().set(AppState::Paused);
-        app.update();
-        let paused_at = x_of(&app);
         for _ in 0..30 {
             app.update();
+            assert!(
+                x_of(&app).to_bits() == after_play.to_bits(),
+                "body drifted while Paused: {after_play} -> {}",
+                x_of(&app)
+            );
         }
-        assert!(
-            (x_of(&app) - paused_at).abs() < 1e-4,
-            "body drifted while Paused: {paused_at} -> {}",
-            x_of(&app)
-        );
     }
 }
