@@ -30,6 +30,12 @@ pub const MIN_SAFE_DT: f32 = 0.0001;
 /// Maximum allowed fixed delta-time (seconds) to prevent lag-spike physics explosions.
 pub const MAX_SAFE_DT: f32 = 0.05;
 
+/// Fixed simulation rate (Hz). Matches the reference's `SIM_DT = 1 / 60`.
+pub const SIM_HZ: f64 = 60.0;
+
+/// Fixed simulation step (seconds) at [`SIM_HZ`].
+pub const SIM_DT_SECS: f32 = 1.0 / 60.0;
+
 /// Top-level application state machine.
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum AppState {
@@ -44,10 +50,16 @@ pub enum AppState {
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PdSystemSet {
     InputAndClock,
+    /// First `FixedUpdate` set: latches the drive control and upgrade picks for this tick.
+    SimInput,
     DozerKinematics,
+    /// Blade/hull impacts against buildings, props and rubble (between kinematics and graph).
+    StructuralImpacts,
     DestructionGraph,
     DebrisLifecycle,
     CrowdAndTrafficAi,
+    /// Last `FixedUpdate` set: awards cash, evaluates milestones and advances [`SimTick`].
+    SimTickEnd,
     WorldTilemapSync,
     HudInterpolation,
 }
@@ -168,11 +180,11 @@ impl Season {
         }
     }
 
-    /// Resolves `Season::Random` deterministically from a `SessionEpoch`.
+    /// Resolves `Season::Random` deterministically from the site seed ([`SiteSeed`]).
     #[must_use]
-    pub const fn resolve(self, epoch: u64) -> Self {
+    pub const fn resolve(self, seed: u64) -> Self {
         match self {
-            Self::Random => match epoch % 4 {
+            Self::Random => match SplitMix64::mix(seed) % 4 {
                 0 => Self::Spring,
                 1 => Self::Summer,
                 2 => Self::Autumn,
@@ -243,6 +255,160 @@ impl SessionEpoch {
         *self
     }
 }
+
+/// SplitMix64 pseudo-random generator: tiny, fast and identical on every platform.
+///
+/// All seeded randomness in the simulation draws from this so a scenario's `seed`
+/// reproduces the run. Never seed it from wall-clock time or entity indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitMix64 {
+    state: u64,
+}
+
+impl SplitMix64 {
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Stateless SplitMix64 finalizer: a well-distributed hash of `value`.
+    #[must_use]
+    pub const fn mix(value: u64) -> u64 {
+        let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    pub const fn next_u64(&mut self) -> u64 {
+        let out = Self::mix(self.state);
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        out
+    }
+
+    /// Uniform `f32` in `[0.0, 1.0)` from the top 24 bits.
+    pub fn next_unit_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / (1_u64 << 24) as f32
+    }
+}
+
+/// Seed for the current site. Every seeded system (season, weather, future layouts) derives
+/// from it. Set on each `SiteRestartRequested` from [`SiteSeedOverride`] or the level default.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SiteSeed(pub u64);
+
+/// Scenario/replay override for [`SiteSeed`]; `None` uses [`default_site_seed`].
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SiteSeedOverride(pub Option<u64>);
+
+/// Fixed per-level seed used until seeded layouts exist.
+#[must_use]
+pub const fn default_site_seed(level: CampaignLevel) -> u64 {
+    0x5EED_0000_0000_0000 | (level.index_one_based() as u64)
+}
+
+/// Number of completed simulation ticks since the last site restart.
+///
+/// A tick is one `FixedUpdate` pass (plus the Avian step that follows it) while
+/// [`sim_running`] holds. Recordings and scenarios are indexed by this counter.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+pub struct SimTick(pub u64);
+
+/// Holds the simulation between ticks without leaving `AppState::Playing`.
+///
+/// Set from inside `FixedUpdate` (e.g. a Campaign upgrade milestone) so no further tick of the
+/// same frame runs before the `AppState` transition lands on the next frame.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimHold(pub bool);
+
+/// Which site layout `Restart Site` builds. `Standard` is the level's procedural block; the
+/// others are fixed benchmark sites used by scenarios.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum SiteTestMap {
+    #[default]
+    Standard,
+    /// The reference's canonical demolition benchmark (`?sandbox=1&ranch=1`): one 5x3-cell,
+    /// single-floor timber ranch with a gable roof, no traffic or pedestrians, and the dozer
+    /// staged 3.4 m off the south facade facing it (`ranchLever.ts`).
+    Ranch,
+}
+
+/// World-space center of the ranch benchmark building.
+pub const RANCH_SITE_ORIGIN: Vec2 = Vec2::new(0.0, 80.0);
+
+impl SiteTestMap {
+    /// Dozer spawn `(world_xy, heading_rad)` for this map.
+    #[must_use]
+    pub fn dozer_spawn(self) -> (Vec2, f32) {
+        match self {
+            Self::Standard => (Vec2::new(0.0, -60.0), 0.0),
+            // South facade sits at origin.y - 15 - 8 = 57; 3.4 m * 16 units/m = 54.4 back.
+            Self::Ranch => (
+                Vec2::new(RANCH_SITE_ORIGIN.x, RANCH_SITE_ORIGIN.y - 23.0 - 54.4),
+                std::f32::consts::FRAC_PI_2,
+            ),
+        }
+    }
+
+    /// Whether the site spawns ambient pedestrians and road traffic.
+    #[must_use]
+    pub const fn has_ambient_agents(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+}
+
+/// Tooling freeze between ticks (replay end, capture ticks, debug stepping). Separate from
+/// [`SimHold`] so gameplay (the Campaign modal) never releases a freeze it did not set.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SimFreeze(pub bool);
+
+/// Who drives the dozer and upgrade picks. Live keyboard/HUD input is ignored under `Replay`.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputAuthority {
+    #[default]
+    Live,
+    Replay,
+}
+
+/// Run condition for every simulation system: `Playing`, not held, and no restart pending.
+#[must_use]
+pub fn sim_running(
+    state: Option<Res<State<AppState>>>,
+    hold: Option<Res<SimHold>>,
+    gate: Option<Res<RestartGate>>,
+    freeze: Option<Res<SimFreeze>>,
+) -> bool {
+    state.is_some_and(|s| *s.get() == AppState::Playing)
+        && !hold.is_some_and(|h| h.0)
+        && !gate.is_some_and(|g| g.pending())
+        && !freeze.is_some_and(|f| f.0)
+}
+
+/// Stable per-site ordering key for simulation entities (buildings, props, debris).
+///
+/// Bevy query order follows archetype creation order and recycled `Entity` indices, both of
+/// which depend on session history. Any pass whose result depends on visit order (float sums,
+/// spawn order, chained blasts) iterates in `SimOrdinal` order instead.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SimOrdinal(pub u64);
+
+/// Fills `out` with `(ordinal, entity)` sorted by [`SimOrdinal`] (entities without one sort
+/// last, by index). Reuse a `Local` buffer for `out` to avoid per-tick allocation.
+pub fn fill_sim_order(
+    out: &mut Vec<(u64, Entity)>,
+    entities: impl Iterator<Item = Entity>,
+    ordinals: &Query<&SimOrdinal>,
+) {
+    out.clear();
+    out.extend(entities.map(|e| (ordinals.get(e).map_or(u64::MAX, |o| o.0), e)));
+    out.sort_unstable_by_key(|&(ord, e)| (ord, e.index()));
+}
+
+/// First [`SimOrdinal`] for destructible props (buildings use `0..`).
+pub const SIM_ORDINAL_PROP_BASE: u64 = 1_000;
+
+/// First [`SimOrdinal`] for debris chunks (per-site serial from the debris pool).
+pub const SIM_ORDINAL_DEBRIS_BASE: u64 = 1_000_000;
 
 /// Marker component placed on every entity spawned for a demolition site (buildings, chunks,
 /// furniture, vehicles, NPCs, decals) so `Restart Site` deterministically cleans up the world.
@@ -974,6 +1140,11 @@ impl ElapsedClock {
         }
     }
 
+    /// Derives elapsed time from completed simulation ticks at [`SIM_HZ`].
+    pub fn set_from_ticks(&mut self, ticks: u64) {
+        self.elapsed_secs = sanitize_f32((ticks as f64 / SIM_HZ) as f32, self.elapsed_secs);
+    }
+
     /// Formats the elapsed timer as `MM:SS` (clamped at `99:59`).
     #[must_use]
     pub fn format_mm_ss(&self) -> String {
@@ -984,22 +1155,16 @@ impl ElapsedClock {
     }
 }
 
-/// System ticking the elapsed clock, cash popup lifetimes, and odometer reel interpolation.
-pub fn tick_core_economy_and_clock_system(
-    time: Res<Time>,
+/// Last system of every simulation tick: credits this tick's demolition cash, then advances
+/// [`SimTick`] and derives the `Elapsed` clock from it, so both are frame-rate independent.
+pub fn award_cash_and_advance_sim_tick_system(
+    mut tick: ResMut<SimTick>,
     mut clock: ResMut<ElapsedClock>,
     mut ledger: ResMut<CashLedger>,
     mut popup_pool: ResMut<CashPopupPool>,
     mut cash_events: EventReader<DemolitionCashEvent>,
 ) {
-    let raw_dt = time.delta_secs();
-    let Ok(dt) = sanitize_dt(raw_dt) else {
-        return;
-    };
-
-    clock.tick(dt);
     popup_pool.current_time_secs = clock.elapsed_secs;
-
     for ev in cash_events.read() {
         if let Err(err) =
             try_award_demolition_cash(&mut ledger, &mut popup_pool, ev.amount, ev.world_pos)
@@ -1007,8 +1172,20 @@ pub fn tick_core_economy_and_clock_system(
             warn!("Failed to award demolition cash: {err:?}");
         }
     }
+    tick.0 = tick.0.saturating_add(1);
+    clock.set_from_ticks(tick.0);
+}
 
-    // Advance floating popups upward and expire completed slots.
+/// Presentation-only animation in `Update`: floating popup rise/expiry and odometer reel roll.
+pub fn animate_cash_popups_and_odometer_system(
+    time: Res<Time>,
+    mut ledger: ResMut<CashLedger>,
+    mut popup_pool: ResMut<CashPopupPool>,
+) {
+    let Ok(dt) = sanitize_dt(time.delta_secs()) else {
+        return;
+    };
+
     for slot in &mut popup_pool.slots {
         if slot.active {
             slot.remaining_lifetime -= dt;
@@ -1031,6 +1208,32 @@ pub fn tick_core_economy_and_clock_system(
     }
 }
 
+/// Counts `SiteRestartRequested` events seen before the fixed loop versus handled in `Update`.
+/// While `seen > handled` a restart is pending and [`sim_running`] is false, so the fixed loop
+/// never ticks the old site with already-reset progression state. Counting (rather than a flag)
+/// stays correct when a request is sent and handled within one `Update`.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RestartGate {
+    pub seen: u64,
+    pub handled: u64,
+}
+
+impl RestartGate {
+    #[must_use]
+    pub const fn pending(&self) -> bool {
+        self.seen > self.handled
+    }
+}
+
+/// `RunFixedMainLoop::BeforeFixedMainLoop`: records restart requests not yet seen here.
+pub fn gate_sim_on_pending_restart_system(
+    mut restart_events: EventReader<SiteRestartRequested>,
+    mut gate: ResMut<RestartGate>,
+) {
+    let count = restart_events.read().count() as u64;
+    gate.seen = gate.seen.saturating_add(count);
+}
+
 /// Handles `SiteRestartRequested` by incrementing `SessionEpoch`, resetting economy/timer state,
 /// and despawning all `SiteScoped` entities deterministically.
 pub fn handle_site_restart_system(
@@ -1042,22 +1245,30 @@ pub fn handle_site_restart_system(
     mut clock: ResMut<ElapsedClock>,
     mut env_config: ResMut<EnvironmentConfig>,
     mut collapse_zones: ResMut<ActiveCollapseZones>,
+    (mut seed, seed_override, mut tick, mut hold, mut gate): (
+        ResMut<SiteSeed>,
+        Res<SiteSeedOverride>,
+        ResMut<SimTick>,
+        ResMut<SimHold>,
+        ResMut<RestartGate>,
+    ),
     site_entities: Query<Entity, With<SiteScoped>>,
 ) {
-    let mut should_restart = false;
-    for _ in restart_events.read() {
-        should_restart = true;
-    }
-    if !should_restart {
+    let count = restart_events.read().count() as u64;
+    if count == 0 {
         return;
     }
+    gate.handled = gate.handled.saturating_add(count);
 
-    let new_epoch = epoch.advance();
+    epoch.advance();
     ledger.reset();
     popup_pool.reset();
     clock.reset();
     collapse_zones.zones.clear();
-    env_config.resolved_season = env_config.season.resolve(new_epoch.0);
+    seed.0 = seed_override.0.unwrap_or(default_site_seed(env_config.level));
+    tick.0 = 0;
+    hold.0 = false;
+    env_config.resolved_season = env_config.season.resolve(seed.0);
 
     for entity in &site_entities {
         if let Some(entity_commands) = commands.get_entity(entity) {
@@ -1078,6 +1289,15 @@ impl Plugin for PdCorePlugin {
             .init_resource::<CashPopupPool>()
             .init_resource::<ElapsedClock>()
             .init_resource::<ActiveCollapseZones>()
+            .init_resource::<SiteSeed>()
+            .init_resource::<SiteSeedOverride>()
+            .init_resource::<SimTick>()
+            .init_resource::<SimHold>()
+            .init_resource::<RestartGate>()
+            .init_resource::<SimFreeze>()
+            .init_resource::<SiteTestMap>()
+            .init_resource::<InputAuthority>()
+            .insert_resource(Time::<Fixed>::from_hz(SIM_HZ))
             .insert_resource(DebugTelemetry {
                 sound_enabled: true,
                 ..Default::default()
@@ -1099,22 +1319,34 @@ impl Plugin for PdCorePlugin {
             .configure_sets(
                 FixedUpdate,
                 (
+                    PdSystemSet::SimInput,
                     PdSystemSet::DozerKinematics,
+                    PdSystemSet::StructuralImpacts,
                     PdSystemSet::DestructionGraph,
                     PdSystemSet::DebrisLifecycle,
                     PdSystemSet::CrowdAndTrafficAi,
+                    PdSystemSet::SimTickEnd,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(sim_running),
             )
             .add_systems(
                 Update,
                 (
                     handle_site_restart_system,
-                    tick_core_economy_and_clock_system
-                        .run_if(in_state(AppState::Playing)),
+                    animate_cash_popups_and_odometer_system.run_if(in_state(AppState::Playing)),
                 )
                     .chain()
                     .in_set(PdSystemSet::InputAndClock),
+            )
+            .add_systems(
+                RunFixedMainLoop,
+                gate_sim_on_pending_restart_system
+                    .in_set(bevy::app::RunFixedMainLoopSystem::BeforeFixedMainLoop),
+            )
+            .add_systems(
+                FixedUpdate,
+                award_cash_and_advance_sim_tick_system.in_set(PdSystemSet::SimTickEnd),
             );
     }
 }

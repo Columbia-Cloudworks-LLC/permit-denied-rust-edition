@@ -367,12 +367,17 @@ pub enum AgentState {
     },
 }
 
-/// Computes a deterministic, non-zero unit escape vector from an `Entity` ID when the threat
-/// is directly on top of the agent (`distance == 0.0`), preventing division-by-zero (`NaN`).
+/// Stable per-site agent index assigned at spawn. Steering tie-breaks and candidate order use
+/// this, never `Entity::index()` (Bevy recycles indices, so they depend on session history).
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct AgentOrdinal(pub u16);
+
+/// Computes a deterministic, non-zero unit escape vector from a stable agent key (normally
+/// [`AgentOrdinal`]) when the threat is directly on top of the agent (`distance == 0.0`),
+/// preventing division-by-zero (`NaN`).
 #[must_use]
-pub fn deterministic_escape_vector(entity: Entity) -> Vec2 {
-    let idx = entity.index();
-    let angle = (idx % 16) as f32 * (std::f32::consts::TAU / 16.0);
+pub fn deterministic_escape_vector(agent_key: u32) -> Vec2 {
+    let angle = (agent_key % 16) as f32 * (std::f32::consts::TAU / 16.0);
     let candidate = Vec2::new(angle.cos(), angle.sin());
     sanitize_vec2(candidate, Vec2::X)
 }
@@ -380,16 +385,16 @@ pub fn deterministic_escape_vector(entity: Entity) -> Vec2 {
 /// Computes a safe unit vector pointing from `threat_pos` toward `agent_pos`, falling back
 /// to `deterministic_escape_vector` when `distance_squared < 1e-6`.
 #[must_use]
-pub fn safe_flee_direction(agent_pos: Vec2, threat_pos: Vec2, entity: Entity) -> Vec2 {
+pub fn safe_flee_direction(agent_pos: Vec2, threat_pos: Vec2, agent_key: u32) -> Vec2 {
     let safe_agent = sanitize_vec2(agent_pos, Vec2::ZERO);
     let safe_threat = sanitize_vec2(threat_pos, Vec2::ZERO);
     let delta = safe_agent - safe_threat;
     let len_sq = delta.length_squared();
     if !len_sq.is_finite() || len_sq < 1e-6 {
-        deterministic_escape_vector(entity)
+        deterministic_escape_vector(agent_key)
     } else {
         let inv_len = 1.0 / len_sq.sqrt();
-        sanitize_vec2(delta * inv_len, deterministic_escape_vector(entity))
+        sanitize_vec2(delta * inv_len, deterministic_escape_vector(agent_key))
     }
 }
 
@@ -451,15 +456,15 @@ pub fn update_crowd_and_traffic_spatial_grid(
         let mut separation = Vec2::ZERO;
         for &(other_entity, other_pos) in neighbor_scratch.iter().take(MAX_NEIGHBOR_CHECKS) {
             if other_entity != entity {
-                let away = safe_flee_direction(agent_pos, other_pos, entity);
+                let away = safe_flee_direction(agent_pos, other_pos, entity.index());
                 separation += away * 0.25;
             }
         }
 
         let escape_dir =
-            (safe_flee_direction(agent_pos, closest_threat, entity) + separation).normalize_or_zero();
+            (safe_flee_direction(agent_pos, closest_threat, entity.index()) + separation).normalize_or_zero();
         let final_dir = if escape_dir.length_squared() < 1e-4 {
-            deterministic_escape_vector(entity)
+            deterministic_escape_vector(entity.index())
         } else {
             escape_dir
         };
@@ -469,7 +474,7 @@ pub fn update_crowd_and_traffic_spatial_grid(
                 AgentState::PedestrianStroll { .. } | AgentState::PedestrianPanic { .. } => {
                     let vel = sanitize_vec2(
                         final_dir * PEDESTRIAN_PANIC_SPEED,
-                        deterministic_escape_vector(entity) * PEDESTRIAN_PANIC_SPEED,
+                        deterministic_escape_vector(entity.index()) * PEDESTRIAN_PANIC_SPEED,
                     );
                     *state = AgentState::PedestrianPanic {
                         escape_velocity: vel,
@@ -512,6 +517,8 @@ pub fn fixed_crowd_and_traffic_ai_system(
     mut audio_events: EventWriter<AudioTriggerEvent>,
     mut nearby_candidates: Local<Vec<(Entity, Vec2)>>,
     mut neighbor_scratch: Local<Vec<(Entity, Vec2)>>,
+    mut ordered_agents: Local<Vec<(u16, Entity, Vec2)>>,
+    ordinals: Query<&AgentOrdinal>,
     mut agents: Query<(
         Entity,
         &mut AgentState,
@@ -534,11 +541,19 @@ pub fn fixed_crowd_and_traffic_ai_system(
         Vec2::ZERO,
     );
 
-    spatial_grid.clear();
+    // Insert agents in stable ordinal order so every grid bucket (and thus the capped
+    // neighbor scan) is independent of archetype/table iteration order.
+    let ordinal_of = |e: Entity| ordinals.get(e).map_or(u16::MAX, |o| o.0);
+    ordered_agents.clear();
     for (entity, _, world_pose, _, _, transform, _, _, _) in agents.iter() {
         let pos = world_pose
             .map_or_else(|| transform.translation.truncate(), |p| p.pos);
-        spatial_grid.insert(entity, sanitize_vec2(pos, Vec2::ZERO));
+        ordered_agents.push((ordinal_of(entity), entity, sanitize_vec2(pos, Vec2::ZERO)));
+    }
+    ordered_agents.sort_unstable_by_key(|&(ord, entity, _)| (ord, entity.index()));
+    spatial_grid.clear();
+    for &(_, entity, pos) in ordered_agents.iter() {
+        spatial_grid.insert(entity, pos);
     }
 
     nearby_candidates.clear();
@@ -551,13 +566,14 @@ pub fn fixed_crowd_and_traffic_ai_system(
         spatial_grid.query_radius(zone_center, zone_radius, &mut nearby_candidates);
     }
 
-    nearby_candidates.sort_by_key(|(e, _)| e.index());
+    nearby_candidates.sort_by_key(|&(e, _)| (ordinal_of(e), e.index()));
     nearby_candidates.dedup_by_key(|(e, _)| *e);
 
     for idx in 0..nearby_candidates.len() {
         let Some(&(entity, agent_pos)) = nearby_candidates.get(idx) else {
             continue;
         };
+        let agent_key = u32::from(ordinal_of(entity));
         let mut closest_threat = dozer_pos;
         let mut closest_dist_sq = agent_pos.distance_squared(dozer_pos);
         let mut struck_by_collapse = false;
@@ -580,15 +596,15 @@ pub fn fixed_crowd_and_traffic_ai_system(
         let mut separation = Vec2::ZERO;
         for &(other_entity, other_pos) in neighbor_scratch.iter().take(MAX_NEIGHBOR_CHECKS) {
             if other_entity != entity {
-                let away = safe_flee_direction(agent_pos, other_pos, entity);
+                let away = safe_flee_direction(agent_pos, other_pos, agent_key);
                 separation += away * 0.25;
             }
         }
 
         let escape_dir =
-            (safe_flee_direction(agent_pos, closest_threat, entity) + separation).normalize_or_zero();
+            (safe_flee_direction(agent_pos, closest_threat, agent_key) + separation).normalize_or_zero();
         let final_dir = if escape_dir.length_squared() < 1e-4 {
-            deterministic_escape_vector(entity)
+            deterministic_escape_vector(agent_key)
         } else {
             escape_dir
         };
@@ -599,7 +615,7 @@ pub fn fixed_crowd_and_traffic_ai_system(
                     let was_stroll = matches!(*state, AgentState::PedestrianStroll { .. });
                     let vel = sanitize_vec2(
                         final_dir * PEDESTRIAN_PANIC_SPEED,
-                        deterministic_escape_vector(entity) * PEDESTRIAN_PANIC_SPEED,
+                        deterministic_escape_vector(agent_key) * PEDESTRIAN_PANIC_SPEED,
                     );
                     *state = AgentState::PedestrianPanic {
                         escape_velocity: vel,
@@ -609,7 +625,7 @@ pub fn fixed_crowd_and_traffic_ai_system(
                         && let (Some(mut b_box), Some(mut asm)) = (base_box, assembly)
                     {
                         let (new_b, new_a) =
-                            build_pedestrian_iso_assembly(true, (entity.index() % 4) as u8);
+                            build_pedestrian_iso_assembly(true, (agent_key % 4) as u8);
                         *b_box = new_b;
                         *asm = new_a;
                     }
@@ -793,9 +809,12 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
     epoch: Res<SessionEpoch>,
     env_config: Res<EnvironmentConfig>,
     road_graph: Res<RoadSplineGraph>,
+    test_map: Option<Res<pd_core::SiteTestMap>>,
     existing_agents: Query<Entity, With<AgentState>>,
 ) {
-    if existing_agents.iter().next().is_some() {
+    if existing_agents.iter().next().is_some()
+        || test_map.is_some_and(|m| !m.has_ambient_agents())
+    {
         return;
     }
 
@@ -813,6 +832,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
         commands.spawn((
             Name::new(format!("Pedestrian #{i}")),
             SiteScoped { epoch: *epoch },
+            AgentOrdinal(u16::from(i)),
             AgentState::PedestrianStroll {
                 velocity: stroll_vel,
                 facing,
@@ -871,6 +891,7 @@ pub fn ensure_site_crowd_and_traffic_spawned_system(
         commands.spawn((
             Name::new(format!("Traffic Vehicle #{idx} ({archetype:?})")),
             SiteScoped { epoch: *epoch },
+            AgentOrdinal(100_u16.saturating_add(u16::try_from(idx).unwrap_or(u16::MAX))),
             SplineFollower {
                 target_node_index: next_idx,
                 reversing: false,

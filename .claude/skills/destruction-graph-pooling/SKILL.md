@@ -29,6 +29,7 @@ Use this playbook when implementing or updating `pd_destruction`.
    - Coalesce concurrent evaluations on the same `building_id` instead of spawning duplicate async tasks.
    - Cap BFS traversal strictly at `MAX_GRAPH_ITERATIONS` (`4096`) and evaluate material-dependent horizontal `beam_span()` support (`Wood = 2`, `Brick = 2`, `Concrete = 3`, `Steel = 4`).
    - Verify both `result.epoch == current_epoch` and `building.dirty_generation == result.generation` before spawning falling debris clusters.
+   - **Deterministic join:** a dispatched BFS is applied on exactly `SimTick` = dispatch tick + `COLLAPSE_EVAL_LATENCY_TICKS` (`in_flight_due_tick`), blocking on the task if it is late (recorded in `CollapseTaskJoinStats`). Never apply results "whenever ready". Iterate buildings with `BuildingGraphRegistry::ordered_building_ids` (stable `site_ordinal`), never in raw `HashMap` order, and give spawned debris and props a `SimOrdinal`.
 4. **4-layer mass-conserving debris lifecycle & `PileField` (Issue #16):**
    - **Layer 1 — active physics debris:** `avian2d` rigid bodies (max `500` active via `DebrisPoolRegistry::register_or_recycle_oldest`) with simulated 2.5D vertical Z-drop and material-dependent ground friction.
    - **Layer 2 — sleeping instanced rubble:** settled chunks strip physics colliders and rest at `pile_field.height_at(pos)`. Distant unattended chunks above `SOFT_DEBRIS_CLEANUP_THRESHOLD` (`360`) are absorbed into `PileField`, strictly conserving mass and never despawning chunks near or recently touched by the dozer.

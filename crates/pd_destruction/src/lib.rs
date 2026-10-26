@@ -9,14 +9,15 @@
 
 use avian2d::prelude::*;
 use bevy::prelude::*;
-use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, futures_lite::future};
+use bevy::tasks::{AsyncComputeTaskPool, Task, block_on};
 pub use pd_core::MaterialKind;
 use pd_core::{
     ActiveCollapseZones, AppState, AudioSfxKind, AudioTriggerEvent, CampaignLevel, CollapseZone,
     DebugTelemetry, DecalKind, DecalSpawnRequest, DemolitionCashEvent, EnvironmentConfig,
     ISO_BIAS_BUILDING, ISO_BIAS_DEBRIS, ISO_BIAS_INTERIOR_FLOOR, ISO_BIAS_PROP, IsoBoxAssembly,
     IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind, PdSystemSet,
-    RoofSlopeSpec, SessionEpoch, SiteRestartRequested, SiteScoped, WorldPose, iso_depth_key,
+    RANCH_SITE_ORIGIN, RoofSlopeSpec, SIM_ORDINAL_DEBRIS_BASE, SIM_ORDINAL_PROP_BASE, SessionEpoch, SimOrdinal,
+    SimTick, SiteRestartRequested, SiteTestMap, SiteScoped, WorldPose, iso_depth_key,
     sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
 };
 use pd_world::{
@@ -669,6 +670,12 @@ pub struct BuildingGraphEntry {
     pub pending_recheck: bool,
     pub nodes: HashMap<NodeIndex, StructuralNode>,
     pub in_flight_task: Option<Task<CollapseEvalResult>>,
+    /// [`SimTick`] on which the in-flight BFS result is applied (dispatch tick +
+    /// [`COLLAPSE_EVAL_LATENCY_TICKS`]), never earlier, so collapse timing is deterministic.
+    pub in_flight_due_tick: u64,
+    /// Stable spawn index on the site. Order-sensitive passes over buildings sort by this,
+    /// never by `Entity` (indices are recycled) or `HashMap` order (randomly seeded).
+    pub site_ordinal: u32,
 }
 
 impl BuildingGraphEntry {
@@ -708,7 +715,16 @@ impl BuildingGraphEntry {
             pending_recheck: false,
             nodes,
             in_flight_task: None,
+            in_flight_due_tick: 0,
+            site_ordinal: 0,
         }
+    }
+
+    /// Sets the stable site spawn index (see [`BuildingGraphEntry::site_ordinal`]).
+    #[must_use]
+    pub const fn with_site_ordinal(mut self, ordinal: u32) -> Self {
+        self.site_ordinal = ordinal;
+        self
     }
 
     /// Bumps `visual_revision` and refreshes `cached_wall_spans` if stale.
@@ -1007,14 +1023,61 @@ pub fn building_blocks_circle(
 #[derive(Resource, Debug, Default)]
 pub struct BuildingGraphRegistry {
     pub current_epoch: SessionEpoch,
+    /// [`SimTick`] of the tick in progress, synced at `PdSystemSet::SimInput`.
+    pub current_tick: u64,
     pub buildings: HashMap<Entity, BuildingGraphEntry>,
 }
 
 impl BuildingGraphRegistry {
     pub fn clear_for_epoch(&mut self, new_epoch: SessionEpoch) {
         self.current_epoch = new_epoch;
+        self.current_tick = 0;
         self.buildings.clear();
     }
+
+    /// Fills `out` with every building id in stable site order (`site_ordinal`).
+    pub fn ordered_building_ids(&self, out: &mut Vec<Entity>) {
+        out.clear();
+        out.extend(self.buildings.keys().copied());
+        out.sort_by_key(|e| self.buildings.get(e).map_or(u32::MAX, |b| b.site_ordinal));
+    }
+}
+
+/// Ticks between dispatching a structural BFS and applying its result. The result lands on
+/// exactly this tick (blocking if the worker has not finished) so replays stay deterministic.
+pub const COLLAPSE_EVAL_LATENCY_TICKS: u64 = 1;
+
+/// How often applying a BFS result had to wait for its worker (measures whether
+/// [`COLLAPSE_EVAL_LATENCY_TICKS`] is long enough). Diagnostic only; never feeds the sim.
+#[derive(Resource, Debug, Clone, Copy, Default, Serialize)]
+pub struct CollapseTaskJoinStats {
+    pub joins: u64,
+    pub blocked_joins: u64,
+    pub total_block_micros: u64,
+    pub max_block_micros: u64,
+}
+
+impl CollapseTaskJoinStats {
+    pub fn record(&mut self, was_ready: bool, waited: std::time::Duration) {
+        self.joins = self.joins.saturating_add(1);
+        if !was_ready {
+            let micros = u64::try_from(waited.as_micros()).unwrap_or(u64::MAX);
+            self.blocked_joins = self.blocked_joins.saturating_add(1);
+            self.total_block_micros = self.total_block_micros.saturating_add(micros);
+            self.max_block_micros = self.max_block_micros.max(micros);
+        }
+    }
+}
+
+/// `PdSystemSet::SimInput`: stamps the registry with the tick and epoch now running, so
+/// dispatches from `StructuralImpacts` compute their due tick from the current tick.
+pub fn sync_graph_registry_clock_system(
+    tick: Res<SimTick>,
+    epoch: Res<SessionEpoch>,
+    mut graph_registry: ResMut<BuildingGraphRegistry>,
+) {
+    graph_registry.current_tick = tick.0;
+    graph_registry.current_epoch = *epoch;
 }
 
 /// Pure bounded Breadth-First Search (BFS) that finds all intact nodes no longer connected
@@ -1160,6 +1223,9 @@ pub fn queue_structural_integrity_evaluation(
     task_pool: &AsyncComputeTaskPool,
 ) -> EvalStatus {
     let epoch = graph_registry.current_epoch;
+    let due_tick = graph_registry
+        .current_tick
+        .saturating_add(COLLAPSE_EVAL_LATENCY_TICKS);
 
     // 1. Lookup building_id in graph_registry. If missing or already Collapsing, return Skipped.
     let Some(entry) = graph_registry.buildings.get_mut(&building_id) else {
@@ -1198,6 +1264,7 @@ pub fn queue_structural_integrity_evaluation(
     });
 
     entry.in_flight_task = Some(task);
+    entry.in_flight_due_tick = due_tick;
     entry.pending_recheck = false;
     EvalStatus::Dispatched
 }
@@ -1253,6 +1320,8 @@ pub struct DebrisPoolRegistry {
     pub max_capacity: usize,
     pub total_recycled: u64,
     pub dozer_world_pos: Vec2,
+    /// Per-site spawn serial; each chunk gets `SimOrdinal(SIM_ORDINAL_DEBRIS_BASE + serial)`.
+    pub next_debris_serial: u64,
 }
 
 impl Default for DebrisPoolRegistry {
@@ -1262,6 +1331,7 @@ impl Default for DebrisPoolRegistry {
             max_capacity: MAX_ACTIVE_PHYSICS_DEBRIS,
             total_recycled: 0,
             dozer_world_pos: Vec2::new(0.0, -60.0),
+            next_debris_serial: 0,
         }
     }
 }
@@ -1270,6 +1340,14 @@ impl DebrisPoolRegistry {
     pub fn clear(&mut self) {
         self.active_ring.clear();
         self.dozer_world_pos = Vec2::new(0.0, -60.0);
+        self.next_debris_serial = 0;
+    }
+
+    /// Hands out the next stable debris ordinal.
+    pub fn next_debris_ordinal(&mut self) -> SimOrdinal {
+        let serial = self.next_debris_serial;
+        self.next_debris_serial = serial.saturating_add(1);
+        SimOrdinal(SIM_ORDINAL_DEBRIS_BASE.saturating_add(serial))
     }
 
     /// Evicts the oldest active physics debris entity into Tier 2 (`SleepingInstanced`) when the
@@ -1312,8 +1390,16 @@ pub struct ModularBuilding {
 /// Helper that generates a multi-story modular building graph with spatial cell bounds and material HP (`Issue #14`).
 #[must_use]
 pub fn build_procedural_building_graph(stories: u8, footprint_half: i32) -> Vec<StructuralNode> {
+    build_rect_building_graph(stories, footprint_half, footprint_half)
+}
+
+/// Rectangular variant of [`build_procedural_building_graph`]: `(2 * half_x + 1)` by
+/// `(2 * half_y + 1)` cells per story (e.g. the 5x3 ranch is `half_x = 2, half_y = 1`).
+#[must_use]
+pub fn build_rect_building_graph(stories: u8, half_x: i32, half_y: i32) -> Vec<StructuralNode> {
     let clamped_stories = stories.clamp(1, 8);
-    let half = footprint_half.clamp(1, 4);
+    let half_x = half_x.clamp(1, 4);
+    let half_y = half_y.clamp(1, 4);
     let mut nodes = Vec::new();
     let mut coord_to_id: HashMap<(i32, i32, u8), NodeIndex> = HashMap::new();
 
@@ -1332,10 +1418,10 @@ pub fn build_procedural_building_graph(stories: u8, footprint_half: i32) -> Vec<
 
     let mut next_id: NodeIndex = 0;
     for story in 0..clamped_stories {
-        for gy in -half..=half {
-            for gx in -half..=half {
-                let is_perimeter = gx.abs() == half || gy.abs() == half;
-                let is_corner = gx.abs() == half && gy.abs() == half;
+        for gy in -half_y..=half_y {
+            for gx in -half_x..=half_x {
+                let is_perimeter = gx.abs() == half_x || gy.abs() == half_y;
+                let is_corner = gx.abs() == half_x && gy.abs() == half_y;
                 let kind = if story == clamped_stories - 1 && !is_perimeter {
                     StructuralModuleKind::RoofCorrugation
                 } else if is_corner {
@@ -1855,10 +1941,12 @@ pub fn spawn_pooled_debris_chunk_with_material(
         .map(|v| sanitize_vec2(v, Vec2::ZERO))
         .unwrap_or_else(|| Vec2::new(angle.cos() * 24.0, angle.sin() * 24.0));
 
+    let ordinal = debris_pool.next_debris_ordinal();
     let debris_entity = commands
         .spawn((
             Name::new("Falling Structural Debris"),
             SiteScoped { epoch },
+            ordinal,
             DebrisTier::ActivePhysics,
             DebrisChunk {
                 tier: DebrisTier::ActivePhysics,
@@ -2168,6 +2256,8 @@ pub fn apply_prop_damage_and_profile(
 pub fn poll_structural_collapse_tasks_system(
     mut commands: Commands,
     epoch: Res<SessionEpoch>,
+    tick: Res<SimTick>,
+    mut join_stats: ResMut<CollapseTaskJoinStats>,
     mut graph_registry: ResMut<BuildingGraphRegistry>,
     mut debris_pool: ResMut<DebrisPoolRegistry>,
     mut cash_events: EventWriter<DemolitionCashEvent>,
@@ -2185,21 +2275,26 @@ pub fn poll_structural_collapse_tasks_system(
 ) {
     let current_epoch = *epoch;
     graph_registry.current_epoch = current_epoch;
+    graph_registry.current_tick = tick.0;
+    let current_tick = tick.0;
 
     let task_pool = AsyncComputeTaskPool::get();
-    building_ids.clear();
-    building_ids.extend(graph_registry.buildings.keys().copied());
+    graph_registry.ordered_building_ids(&mut building_ids);
 
     for &building_id in building_ids.iter() {
         let mut completed_result: Option<CollapseEvalResult> = None;
         let mut needs_followup = false;
 
+        // Fixed-latency join: apply on exactly the due tick, blocking if the worker is late.
         if let Some(entry) = graph_registry.buildings.get_mut(&building_id)
-            && let Some(task) = &mut entry.in_flight_task
-            && let Some(res) = block_on(future::poll_once(task))
+            && current_tick >= entry.in_flight_due_tick
+            && let Some(task) = entry.in_flight_task.take()
         {
+            let was_ready = task.is_finished();
+            let started = std::time::Instant::now();
+            let res = block_on(task);
+            join_stats.record(was_ready, started.elapsed());
             completed_result = Some(res);
-            entry.in_flight_task = None;
             needs_followup = entry.pending_recheck;
         }
 
@@ -2357,8 +2452,7 @@ pub fn step_building_roofs_and_collapse_sites_system(
     let current_epoch = *epoch;
     let task_pool = AsyncComputeTaskPool::get();
 
-    building_ids.clear();
-    building_ids.extend(graph_registry.buildings.keys().copied());
+    graph_registry.ordered_building_ids(&mut building_ids);
     domino_impacts.clear();
 
     for &building_id in building_ids.iter() {
@@ -2624,7 +2718,7 @@ pub fn update_debris_lifecycle_system(
     mut pile_field: Option<ResMut<PileField>>,
     graph_registry: Res<BuildingGraphRegistry>,
     mut telemetry: ResMut<DebugTelemetry>,
-    mut cleanup_candidates: Local<Vec<(Entity, Vec2, f32, MaterialKind, f32)>>,
+    mut cleanup_candidates: Local<Vec<(Entity, Vec2, f32, MaterialKind, f32, u64)>>,
     mut debris_query: Query<(
         Entity,
         &mut DebrisChunk,
@@ -2633,6 +2727,7 @@ pub fn update_debris_lifecycle_system(
         Option<&mut Rotation>,
         &mut Transform,
         Option<&LinearVelocity>,
+        Option<&SimOrdinal>,
     )>,
 ) {
     let Ok(dt) = sanitize_dt(time.delta_secs()) else {
@@ -2645,8 +2740,16 @@ pub fn update_debris_lifecycle_system(
 
     let dozer_pos = sanitize_vec2(debris_pool.dozer_world_pos, Vec2::new(0.0, -60.0));
 
-    for (entity, mut chunk, mut world_pose, mut phys_pos, mut phys_rot, mut transform, lin_vel) in
-        &mut debris_query
+    for (
+        entity,
+        mut chunk,
+        mut world_pose,
+        mut phys_pos,
+        mut phys_rot,
+        mut transform,
+        lin_vel,
+        ordinal,
+    ) in &mut debris_query
     {
         chunk.unattended_secs = sanitize_f32(chunk.unattended_secs + dt, 0.0);
         chunk.recently_touched_secs =
@@ -2754,6 +2857,7 @@ pub fn update_debris_lifecycle_system(
                         chunk.mass,
                         chunk.material,
                         priority,
+                        ordinal.map_or(u64::MAX, |o| o.0),
                     ));
                 }
             }
@@ -2765,15 +2869,17 @@ pub fn update_debris_lifecycle_system(
     if sleeping_count > SOFT_DEBRIS_CLEANUP_THRESHOLD
         && let Some(pf) = pile_field.as_deref_mut()
     {
+        // Farthest first; equal priorities fall back to the stable SimOrdinal, not query order.
         cleanup_candidates.sort_by(|a, b| {
             b.4.partial_cmp(&a.4)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.5.cmp(&b.5))
         });
         let to_absorb = sleeping_count
             .saturating_sub(SOFT_DEBRIS_CLEANUP_THRESHOLD)
             .min(cleanup_candidates.len());
         for i in 0..to_absorb {
-            if let Some(&(ent, pos, mass, mat, _)) = cleanup_candidates.get(i) {
+            if let Some(&(ent, pos, mass, mat, _, _)) = cleanup_candidates.get(i) {
                 pf.add_mass(pos, mass, mat);
                 debris_pool.active_ring.retain(|&e| e != ent);
                 if let Some(e_cmds) = commands.get_entity(ent) {
@@ -2810,6 +2916,7 @@ pub fn ensure_site_buildings_spawned_system(
     manifest: Res<CampaignPrefabsManifest>,
     _atlas: Res<ProceduralWorldAtlas>,
     mut graph_registry: ResMut<BuildingGraphRegistry>,
+    test_map: Option<Res<SiteTestMap>>,
     existing_buildings: Query<Entity, With<ModularBuilding>>,
 ) {
     if existing_buildings.iter().next().is_some() {
@@ -2817,6 +2924,10 @@ pub fn ensure_site_buildings_spawned_system(
     }
 
     graph_registry.current_epoch = *epoch;
+    if test_map.is_some_and(|m| *m == SiteTestMap::Ranch) {
+        spawn_ranch_benchmark_site(&mut commands, *epoch, &mut graph_registry);
+        return;
+    }
     let level_idx = env_config.level.index_one_based();
     let stories = manifest
         .entry_for_level(env_config.level)
@@ -2887,6 +2998,7 @@ pub fn ensure_site_buildings_spawned_system(
             commands.spawn((
                 Name::new(format!("Interior Prop ({prop_arch:?})")),
                 SiteScoped { epoch: *epoch },
+                SimOrdinal(SIM_ORDINAL_PROP_BASE.saturating_add((idx * 4 + p_i) as u64)),
                 DestructibleProp::new(prop_arch, true),
                 WorldPose::new(prop_pos, 2.0, 0.0),
                 IsoLayerBias(ISO_BIAS_PROP),
@@ -2898,7 +3010,8 @@ pub fn ensure_site_buildings_spawned_system(
             ));
         }
 
-        let entry = BuildingGraphEntry::new(*epoch, nodes);
+        let entry = BuildingGraphEntry::new(*epoch, nodes)
+            .with_site_ordinal(u32::try_from(idx).unwrap_or(u32::MAX));
         let (b_base, b_asm) = build_building_iso_assembly_from_entry(&entry, stories, idx);
         let compound_collider = build_building_compound_collider(&entry.nodes)
             .unwrap_or_else(|| Collider::rectangle(108.0, 76.0));
@@ -2909,6 +3022,7 @@ pub fn ensure_site_buildings_spawned_system(
             .spawn((
                 Name::new(format!("Modular Building #{idx}: {archetype_name} (L{level_idx})")),
                 SiteScoped { epoch: *epoch },
+                SimOrdinal(idx as u64),
                 ModularBuilding {
                     archetype_name,
                     stories,
@@ -2952,13 +3066,14 @@ pub fn ensure_site_buildings_spawned_system(
         (PropArchetype::HayBale, Vec2::new(-130.0, 195.0)),
     ];
 
-    for (arch, pos) in exterior_specs {
+    for (ext_idx, (arch, pos)) in exterior_specs.into_iter().enumerate() {
         let prop_iso = world_to_iso_screen(pos, 0.0);
         let prop_z = iso_depth_key(pos, 6.0, ISO_BIAS_PROP);
         let (prop_base, prop_asm) = build_prop_iso_assembly(arch);
         commands.spawn((
             Name::new(format!("Exterior Street Prop ({arch:?})")),
             SiteScoped { epoch: *epoch },
+            SimOrdinal(SIM_ORDINAL_PROP_BASE.saturating_add(500 + ext_idx as u64)),
             DestructibleProp::new(arch, false),
             WorldPose::new(pos, 0.0, 0.0),
             IsoLayerBias(ISO_BIAS_PROP),
@@ -2969,6 +3084,98 @@ pub fn ensure_site_buildings_spawned_system(
             Visibility::default(),
         ));
     }
+}
+
+/// Ranch benchmark ([`SiteTestMap::Ranch`]), hand-built from the reference's
+/// `residential/ranch/main.building.json`: 5x3 cells, one floor, timber walls and posts, gable
+/// roof along x (three West/Center/East bays), with kitchen / living / bath fixtures inside.
+/// The reference's chimney and south door opening are not modeled (no such modules yet).
+pub fn spawn_ranch_benchmark_site(
+    commands: &mut Commands,
+    epoch: SessionEpoch,
+    graph_registry: &mut BuildingGraphRegistry,
+) {
+    let origin = RANCH_SITE_ORIGIN;
+    let mut nodes = build_rect_building_graph(1, 2, 1);
+    for node in &mut nodes {
+        if node.kind == StructuralModuleKind::LoadBearingPillar {
+            // Timber house: corner posts are wood, not the procedural brick piers.
+            node.material = MaterialKind::Wood;
+            node.facade_material = MaterialKind::Wood;
+            node.hp = MaterialKind::Wood.default_hp();
+            node.max_hp = node.hp;
+        }
+    }
+
+    let floor_iso = world_to_iso_screen(origin, 0.5);
+    commands.spawn((
+        Name::new("Ranch Interior Flooring"),
+        SiteScoped { epoch },
+        WorldPose::new(origin, 0.5, 0.0),
+        IsoLayerBias(ISO_BIAS_INTERIOR_FLOOR),
+        IsoExtrudedBox::new(104.0, 44.0, 1.8, Color::srgb(0.80, 0.70, 0.55)).with_shadow(false),
+        Transform::from_xyz(floor_iso.x, floor_iso.y, iso_depth_key(origin, 0.5, ISO_BIAS_INTERIOR_FLOOR)),
+        GlobalTransform::default(),
+        Visibility::default(),
+    ));
+
+    // Kitchen (west), living (center), bath (east), as in main.layout.json.
+    let fixtures = [
+        (PropArchetype::Refrigerator, Vec2::new(-38.0, 6.0)),
+        (PropArchetype::Couch, Vec2::new(0.0, 8.0)),
+        (PropArchetype::Toilet, Vec2::new(38.0, 4.0)),
+    ];
+    for (i, (arch, local)) in fixtures.into_iter().enumerate() {
+        let pos = origin + local;
+        let (prop_base, prop_asm) = build_prop_iso_assembly(arch);
+        let iso = world_to_iso_screen(pos, 2.0);
+        commands.spawn((
+            Name::new(format!("Ranch Fixture ({arch:?})")),
+            SiteScoped { epoch },
+            SimOrdinal(SIM_ORDINAL_PROP_BASE.saturating_add(i as u64)),
+            DestructibleProp::new(arch, true),
+            WorldPose::new(pos, 2.0, 0.0),
+            IsoLayerBias(ISO_BIAS_PROP),
+            prop_base,
+            prop_asm,
+            Transform::from_xyz(iso.x, iso.y, iso_depth_key(pos, 2.0, ISO_BIAS_PROP)),
+            GlobalTransform::default(),
+            Visibility::default(),
+        ));
+    }
+
+    let entry = BuildingGraphEntry::new(epoch, nodes).with_site_ordinal(0);
+    let (b_base, b_asm) = build_building_iso_assembly_from_entry(&entry, 1, 0);
+    let collider = build_building_compound_collider(&entry.nodes)
+        .unwrap_or_else(|| Collider::rectangle(108.0, 46.0));
+    let b_iso = world_to_iso_screen(origin, 0.0);
+    let b_entity = commands
+        .spawn((
+            Name::new("Ranch (benchmark)"),
+            SiteScoped { epoch },
+            SimOrdinal(0),
+            ModularBuilding {
+                archetype_name: "RANCH".to_string(),
+                stories: 1,
+                palette_index: 0,
+            },
+            CutawayFootprint {
+                min_world: origin - Vec2::new(60.0, 32.0),
+                max_world: origin + Vec2::new(60.0, 32.0),
+                exterior_breached: false,
+                current_roof_alpha: 1.0,
+            },
+            WorldPose::new(origin, 0.0, 0.0),
+            IsoLayerBias(ISO_BIAS_BUILDING),
+            b_base,
+            b_asm,
+            Transform::from_xyz(b_iso.x, b_iso.y, iso_depth_key(origin, 16.0, ISO_BIAS_BUILDING)),
+            GlobalTransform::default(),
+            Visibility::default(),
+            (Position(origin), Rotation::IDENTITY, RigidBody::Static, collider),
+        ))
+        .id();
+    graph_registry.buildings.insert(b_entity, entry);
 }
 
 /// Resets `BuildingGraphRegistry` and `DebrisPoolRegistry` on `SiteRestartRequested`.
@@ -2998,6 +3205,7 @@ impl Plugin for PdDestructionPlugin {
         app.insert_resource(CampaignPrefabsManifest::load_embedded())
             .init_resource::<BuildingGraphRegistry>()
             .init_resource::<DebrisPoolRegistry>()
+            .init_resource::<CollapseTaskJoinStats>()
             .add_systems(
                 Update,
                 (
@@ -3011,6 +3219,7 @@ impl Plugin for PdDestructionPlugin {
             .add_systems(
                 FixedUpdate,
                 (
+                    sync_graph_registry_clock_system.in_set(PdSystemSet::SimInput),
                     (
                         poll_structural_collapse_tasks_system,
                         step_building_roofs_and_collapse_sites_system,

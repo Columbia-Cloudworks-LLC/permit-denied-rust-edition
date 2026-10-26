@@ -23,7 +23,10 @@ Use this playbook when implementing or modifying `pd_world` tilemaps, isometric 
    - Isometric 2D sorting computes a deterministic depth:
      `z = base_layer_z - (iso_y * 0.001) - (iso_x * 0.00001) + (simulated_height * 0.01)`
    - Validate that `z.is_finite()` and lies within the camera near/far clip planes (`[-900.0, 900.0]`).
-4. **Cutaway mask hygiene:**
+4. **The projection is a mirror image:**
+   - `world_to_iso_screen` maps world +X to screen `(1, -0.5)` and +Y to `(-1, -0.5)`. That basis has a negative determinant, so a counter-clockwise turn in world space reads as clockwise on screen, and the dozer's world-left track is drawn on its screen-right side.
+   - Anything that turns a screen-space intent (keys, mouse, touch, "left/right" in copy) into world space must account for this. The dozer keys do so in `pd_dozer::screen_tracks_to_world_tracks` (A / Left gives a decreasing heading, as in the reference).
+5. **Cutaway mask hygiene:**
    - When the dozer breaches an exterior wall or enters a building footprint, upper-floor/roof alpha fades smoothly using clamped `[0.0, 1.0]` interpolation to reveal interior flooring tiles and furniture sprites.
 
 ## 2. Verification gate

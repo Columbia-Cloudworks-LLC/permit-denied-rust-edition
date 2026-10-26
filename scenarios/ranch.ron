@@ -1,0 +1,110 @@
+// Ranch benchmark: the Rust equivalent of the reference's canonical demolition run
+// (`?sandbox=1&ranch=1` + the recorded playthrough in src/game/Game.test.ts):
+// hold W 150 frames, pick upgrade 1 (AR400 Edge) and hold the blade 20 frames, hold W+A
+// 40 frames, W 60 more, then idle 30. Capture labels follow ranchLever.ts phases.
+// Regenerate the expected digest with:
+//   cargo run -- --scenario scenarios/ranch.ron --headless --write-expect
+(
+    format: "permit-denied-scenario",
+    version: 1,
+    name: "ranch",
+    build: "permit_denied 0.1.0",
+    recorded_at: None,
+    seed: 1,
+    settings: (
+        mode: Sandbox,
+        level: County1,
+        season: Summer,
+        weather: Off,
+        test_map: Ranch,
+        upgrades: (
+            ar400_edge: 1.0,
+            charge_air_kit: 1.0,
+            aux_ram: 1.0,
+        ),
+    ),
+    controls: [
+        (0, 1.0, 1.0, false),
+        (150, 1.0, 1.0, true),
+        (170, 2.0, 0.0, false),
+        (210, 1.0, 1.0, false),
+        (270, 0.0, 0.0, false),
+    ],
+    actions: [
+        Upgrade(
+            at: 150,
+            choice: Ar400Edge,
+        ),
+    ],
+    captures: [
+        (
+            tick: 0,
+            label: "intact",
+        ),
+        (
+            tick: 25,
+            label: "first south breach",
+        ),
+        (
+            tick: 30,
+            label: "mid-collapse (breached)",
+        ),
+        (
+            tick: 45,
+            label: "mid-collapse (sag)",
+        ),
+        (
+            tick: 70,
+            label: "mid-collapse (fall)",
+        ),
+        (
+            tick: 100,
+            label: "half destroyed",
+        ),
+        (
+            tick: 140,
+            label: "near-total",
+        ),
+        (
+            tick: 210,
+            label: "blade pass",
+        ),
+        (
+            tick: 300,
+            label: "settled",
+        ),
+    ],
+    overlays: (
+        telemetry: false,
+        colliders: false,
+        zoom: Some(2.5),
+    ),
+    exit_tick: 300,
+    expect: Some((
+        ticks: 300,
+        cash: 624,
+        elapsed: 5.0,
+        dozer: (
+            x: 177.06494,
+            y: 264.9864,
+            heading: 0.8044764,
+            heat: 23.460835,
+            track: 3.1684957,
+        ),
+        upgrades: (
+            ar400_edge: 1.42,
+            charge_air_kit: 1.0,
+            aux_ram: 1.0,
+        ),
+        debris: 7,
+        debris_mass: 9.3,
+        pile_mass: 22.199997,
+        cells: {
+            "cracked": 0,
+            "destroyed": 15,
+            "intact": 0,
+        },
+        cell_hp: 0.0,
+        state_hash: 9127779547408162954,
+    )),
+)

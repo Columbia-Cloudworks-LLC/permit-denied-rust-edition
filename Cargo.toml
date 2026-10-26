@@ -7,6 +7,7 @@ members = [
     "crates/pd_destruction",
     "crates/pd_ai",
     "crates/pd_ui",
+    "crates/pd_replay",
 ]
 resolver = "2"
 
@@ -22,12 +23,15 @@ bevy_ecs_tilemap = "0.15"
 leafwing-input-manager = "0.16"
 ron = "0.8"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+image = { version = "0.25", default-features = false, features = ["png"] }
 pd_core = { path = "crates/pd_core" }
 pd_dozer = { path = "crates/pd_dozer" }
 pd_world = { path = "crates/pd_world" }
 pd_destruction = { path = "crates/pd_destruction" }
 pd_ai = { path = "crates/pd_ai" }
 pd_ui = { path = "crates/pd_ui" }
+pd_replay = { path = "crates/pd_replay" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
@@ -56,6 +60,11 @@ pd_world.workspace = true
 pd_destruction.workspace = true
 pd_ai.workspace = true
 pd_ui.workspace = true
+pd_replay.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+ron.workspace = true
 
 [lints]
 workspace = true

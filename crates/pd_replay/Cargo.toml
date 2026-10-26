@@ -1,0 +1,17 @@
+[package]
+name = "pd_replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy.workspace = true
+serde.workspace = true
+ron.workspace = true
+pd_core.workspace = true
+pd_world.workspace = true
+pd_dozer.workspace = true
+pd_destruction.workspace = true
+
+[lints]
+workspace = true

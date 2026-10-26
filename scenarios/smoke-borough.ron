@@ -1,0 +1,82 @@
+// Smoke scenario: pivot toward building #0 on the City Borough block, ram it blade-down,
+// back off and hit it again. Exercises collapse BFS, debris and the PileField.
+(
+    format: "permit-denied-scenario",
+    version: 1,
+    name: "smoke-borough",
+    build: "permit_denied 0.1.0",
+    recorded_at: None,
+    seed: 53261,
+    settings: (
+        mode: Sandbox,
+        level: CityBorough5,
+        season: Autumn,
+        weather: Off,
+        test_map: Standard,
+        upgrades: (
+            ar400_edge: 1.0,
+            charge_air_kit: 1.0,
+            aux_ram: 1.0,
+        ),
+    ),
+    controls: [
+        (0, -1.0, 1.0, false),
+        (48, 1.0, 1.0, false),
+        (110, 1.0, 1.0, true),
+        (300, -1.0, -1.0, false),
+        (360, 1.0, -1.0, true),
+        (380, 1.0, 1.0, true),
+        (560, 0.0, 0.0, false),
+    ],
+    actions: [],
+    captures: [
+        (
+            tick: 0,
+            label: "start",
+        ),
+        (
+            tick: 200,
+            label: "first breach",
+        ),
+        (
+            tick: 400,
+            label: "second pass",
+        ),
+        (
+            tick: 640,
+            label: "end",
+        ),
+    ],
+    overlays: (
+        telemetry: true,
+        colliders: true,
+    ),
+    exit_tick: 640,
+    expect: Some((
+        ticks: 640,
+        cash: 638,
+        elapsed: 10.666667,
+        dozer: (
+            x: -116.89792,
+            y: 396.06442,
+            heading: 1.6819884,
+            heat: 70.48422,
+            track: 36.671062,
+        ),
+        upgrades: (
+            ar400_edge: 1.0,
+            charge_air_kit: 1.0,
+            aux_ram: 1.0,
+        ),
+        debris: 14,
+        debris_mass: 18.060001,
+        pile_mass: 15.789999,
+        cells: {
+            "cracked": 14,
+            "destroyed": 19,
+            "intact": 267,
+        },
+        cell_hp: 16846.0,
+        state_hash: 7807638542462282579,
+    )),
+)

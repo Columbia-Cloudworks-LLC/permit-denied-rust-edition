@@ -3639,6 +3639,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pd_replay"
+version = "0.1.0"
+dependencies = [
+ "bevy",
+ "pd_core",
+ "pd_destruction",
+ "pd_dozer",
+ "pd_world",
+ "ron",
+ "serde",
+]
+
+[[package]]
 name = "pd_ui"
 version = "0.1.0"
 dependencies = [
@@ -3672,12 +3685,17 @@ dependencies = [
  "avian2d",
  "bevy",
  "bevy_ecs_tilemap",
+ "image",
  "pd_ai",
  "pd_core",
  "pd_destruction",
  "pd_dozer",
+ "pd_replay",
  "pd_ui",
  "pd_world",
+ "ron",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

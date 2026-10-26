@@ -26,6 +26,7 @@ Use this playbook when implementing or modifying `pd_dozer`.
 2. **Interactive milestone & Sandbox upgrades (`UpgradeProgression`):**
    - In `GameMode::Campaign`, crossing cash milestones (`$350`, `$900`, `$1,600`, then every `+$900`) increments `pending_upgrade_choices` and pauses the simulation until the player selects `1` (`AR400 Edge +42%`), `2` (`Charge-Air Kit +28%`) or `3` (`Aux Ram +35%`). Advancing levels snapshots `level_entry_upgrades`; retrying a site restores `level_entry_upgrades`.
    - In `GameMode::Sandbox`, pressing `1` / `2` / `3` applies upgrades immediately without pausing or requiring cash milestones.
+   - Picks (hotkeys, HUD modal, replay feed) go through `UpgradePickQueue` and are applied at a tick boundary by `apply_upgrade_picks_system`. Milestones are evaluated in `PdSystemSet::SimTickEnd` and raise `SimHold` so no later tick of the frame runs. Live drive input reaches kinematics only through `LiveDriveControl` → `latch_drive_control_system` (skipped under `InputAuthority::Replay`).
 3. **Anti-wedging & depenetration watchdog:**
    - Cap the maximum impulse applied to the dozer per `FixedUpdate` tick (`MAX_DOZER_IMPULSE_PER_TICK`).
    - Track consecutive ticks where penetration depth exceeds `MAX_SAFE_PENETRATION_DEPTH`. After more than 3 consecutive ticks, crush the intersecting block or displace the dozer `+0.5m` along its safe recovery normal.
