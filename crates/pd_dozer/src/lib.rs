@@ -10,10 +10,11 @@ use avian2d::{prelude::*, prepare::PrepareConfig, sync::SyncConfig};
 use bevy::prelude::*;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, CampaignLevel, CashLedger, CashPopupPool,
-    DecalKind, DecalSpawnRequest, EnvironmentConfig, GameMode, ISO_BIAS_DOZER, IsoBoxAssembly,
-    IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind, PdSystemSet,
-    PhysicsError, SessionEpoch, SiteRestartRequested, SiteScoped, WorldPose, heading_offset,
-    iso_depth_key, sanitize_dt, sanitize_f32, sanitize_vec2, world_to_iso_screen,
+    DecalKind, DecalSpawnRequest, EnvironmentConfig, GameMode, ISO_BIAS_DOZER, InputAuthority,
+    IsoBoxAssembly, IsoExtrudedBox, IsoLayerBias, ParticleBurstEvent, ParticleBurstKind,
+    PdSystemSet, PhysicsError, SessionEpoch, SimHold, SimTick, SiteRestartRequested, SiteScoped,
+    WorldPose, heading_offset, iso_depth_key, sanitize_dt, sanitize_f32, sanitize_vec2,
+    world_to_iso_screen,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1149,7 +1150,8 @@ pub fn ensure_player_dozer_spawned_system(
 /// Reads keyboard input to update `TrackInput` (throttle, steering, and `Space` powered blade hold).
 pub fn read_dozer_keyboard_input_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
-    mut track_input: ResMut<TrackInput>,
+    track_input: Res<TrackInput>,
+    mut live: ResMut<LiveDriveControl>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
 ) {
     let Some(keys) = keys else {
@@ -1166,7 +1168,7 @@ pub fn read_dozer_keyboard_input_system(
         });
     }
 
-    track_input.blade_pressed = keys.pressed(KeyCode::Space)
+    live.blade_pressed = keys.pressed(KeyCode::Space)
         || keys.pressed(KeyCode::KeyF)
         || keys.pressed(KeyCode::KeyR)
         || keys.pressed(KeyCode::ShiftLeft);
@@ -1203,68 +1205,159 @@ pub fn read_dozer_keyboard_input_system(
         right = -1.0;
     }
 
-    track_input.left_track = left;
-    track_input.right_track = right;
+    live.left_track = left;
+    live.right_track = right;
 }
 
-/// Evaluates demolition cash milestones (`$350`, `$900`, `$1,600`) and handles interactive
-/// `1` / `2` / `3` upgrade selection (`Issue #13`).
-/// - In `GameMode::Campaign`, crossing a cash milestone pauses the simulation (`AppState::Paused`)
-///   until the player selects an upgrade (`Digit1`, `Digit2`, `Digit3`, or HUD modal button).
-/// - In `GameMode::Sandbox`, `Digit1`, `Digit2`, and `Digit3` apply upgrades immediately without pausing.
-pub fn evaluate_upgrade_milestones_and_hotkeys_system(
+/// Drive control requested by the player this frame (keyboard), latched into [`TrackInput`]
+/// once per simulation tick by [`latch_drive_control_system`].
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct LiveDriveControl {
+    pub left_track: f32,
+    pub right_track: f32,
+    pub blade_pressed: bool,
+}
+
+/// First system of every tick (`PdSystemSet::SimInput`): copies the live drive control into
+/// [`TrackInput`] so each tick sees exactly one control sample regardless of frame pacing.
+/// Under `InputAuthority::Replay` the replay feed writes `TrackInput` instead.
+pub fn latch_drive_control_system(
+    authority: Res<InputAuthority>,
+    live: Res<LiveDriveControl>,
+    mut track_input: ResMut<TrackInput>,
+) {
+    if *authority != InputAuthority::Live {
+        return;
+    }
+    track_input.left_track = sanitize_f32(live.left_track, 0.0).clamp(-2.0, 2.0);
+    track_input.right_track = sanitize_f32(live.right_track, 0.0).clamp(-2.0, 2.0);
+    track_input.blade_pressed = live.blade_pressed;
+}
+
+/// Upgrade picks waiting for the next tick boundary (hotkeys, HUD modal buttons, replay feed).
+#[derive(Resource, Debug, Clone, Default)]
+pub struct UpgradePickQueue {
+    pub picks: Vec<UpgradeChoice>,
+}
+
+impl UpgradePickQueue {
+    /// Queues a pick; at most 8 may wait so a held key or a corrupt feed cannot grow it.
+    pub fn push(&mut self, choice: UpgradeChoice) {
+        if self.picks.len() < 8 {
+            self.picks.push(choice);
+        }
+    }
+}
+
+/// Fired when an upgrade pick is applied, stamped with the [`SimTick`] it applied before.
+#[derive(Event, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpgradeApplied {
+    pub choice: UpgradeChoice,
+    pub at_tick: u64,
+}
+
+/// Reads `1` / `2` / `3` (and numpad) upgrade hotkeys into [`UpgradePickQueue`] (`Issue #13`).
+/// Picks are applied on the next tick boundary by [`apply_upgrade_picks_system`].
+pub fn read_upgrade_hotkeys_system(
     keys: Option<Res<ButtonInput<KeyCode>>>,
+    authority: Res<InputAuthority>,
+    app_state: Res<State<AppState>>,
+    mut queue: ResMut<UpgradePickQueue>,
+) {
+    let state = *app_state.get();
+    if *authority != InputAuthority::Live
+        || !(state == AppState::Playing || state == AppState::Paused)
+    {
+        return;
+    }
+    let Some(keys) = keys else {
+        return;
+    };
+    let choice = if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1) {
+        Some(UpgradeChoice::Ar400Edge)
+    } else if keys.just_pressed(KeyCode::Digit2) || keys.just_pressed(KeyCode::Numpad2) {
+        Some(UpgradeChoice::ChargeAirKit)
+    } else if keys.just_pressed(KeyCode::Digit3) || keys.just_pressed(KeyCode::Numpad3) {
+        Some(UpgradeChoice::AuxRam)
+    } else {
+        None
+    };
+    if let Some(choice) = choice {
+        queue.push(choice);
+    }
+}
+
+/// Applies queued upgrade picks at a tick boundary: before the first tick of a frame
+/// (`RunFixedMainLoop`, which also covers a held/paused Campaign modal) and at the start of
+/// every tick (`PdSystemSet::SimInput`). Either way the pick lands before tick `SimTick` runs.
+/// - `GameMode::Campaign`: consumes a pending milestone choice; when none remain, releases
+///   [`SimHold`] and resumes `AppState::Playing`.
+/// - `GameMode::Sandbox`: applies immediately.
+pub fn apply_upgrade_picks_system(
     app_state: Res<State<AppState>>,
     mut next_state: ResMut<NextState<AppState>>,
     env_config: Res<EnvironmentConfig>,
-    ledger: Res<CashLedger>,
+    tick: Res<SimTick>,
+    mut hold: ResMut<SimHold>,
+    mut queue: ResMut<UpgradePickQueue>,
     mut upgrades: ResMut<UpgradeMultipliers>,
     mut progression: ResMut<UpgradeProgression>,
+    mut applied_events: EventWriter<UpgradeApplied>,
     mut audio_events: EventWriter<AudioTriggerEvent>,
 ) {
+    if queue.picks.is_empty() {
+        return;
+    }
     let state = *app_state.get();
-    if env_config.mode == GameMode::Campaign {
-        if state == AppState::Playing || state == AppState::Paused {
-            let _unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
-        }
-    } else {
-        progression.pending_upgrade_choices = 0;
+    if !(state == AppState::Playing || state == AppState::Paused) {
+        queue.picks.clear();
+        return;
     }
 
     let mut choice_applied = false;
-    if (state == AppState::Playing || state == AppState::Paused)
-        && let Some(keys) = keys
-    {
-        let maybe_choice =
-            if keys.just_pressed(KeyCode::Digit1) || keys.just_pressed(KeyCode::Numpad1) {
-                Some(UpgradeChoice::Ar400Edge)
-            } else if keys.just_pressed(KeyCode::Digit2) || keys.just_pressed(KeyCode::Numpad2) {
-                Some(UpgradeChoice::ChargeAirKit)
-            } else if keys.just_pressed(KeyCode::Digit3) || keys.just_pressed(KeyCode::Numpad3) {
-                Some(UpgradeChoice::AuxRam)
-            } else {
-                None
-            };
-
-        if let Some(choice) = maybe_choice
-            && progression.try_apply_choice(&mut upgrades, env_config.mode, choice)
-        {
+    for choice in queue.picks.drain(..) {
+        if progression.try_apply_choice(&mut upgrades, env_config.mode, choice) {
             choice_applied = true;
+            applied_events.send(UpgradeApplied {
+                choice,
+                at_tick: tick.0,
+            });
             audio_events.send(AudioTriggerEvent {
                 kind: AudioSfxKind::CashDing,
             });
         }
     }
 
-    if env_config.mode == GameMode::Campaign {
-        if progression.pending_upgrade_choices > 0 && state == AppState::Playing {
-            next_state.set(AppState::Paused);
-        } else if choice_applied
-            && progression.pending_upgrade_choices == 0
-            && state == AppState::Paused
-        {
+    if choice_applied
+        && env_config.mode == GameMode::Campaign
+        && progression.pending_upgrade_choices == 0
+        && hold.0
+    {
+        hold.0 = false;
+        if state == AppState::Paused {
             next_state.set(AppState::Playing);
         }
+    }
+}
+
+/// Evaluates demolition cash milestones (`$350`, `$900`, `$1,600`) at the end of each tick,
+/// after the tick's cash is credited. In `GameMode::Campaign`, crossing one sets [`SimHold`]
+/// (no further tick of this frame runs) and opens the upgrade modal (`AppState::Paused`).
+pub fn evaluate_cash_milestones_system(
+    env_config: Res<EnvironmentConfig>,
+    ledger: Res<CashLedger>,
+    mut progression: ResMut<UpgradeProgression>,
+    mut hold: ResMut<SimHold>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if env_config.mode != GameMode::Campaign {
+        progression.pending_upgrade_choices = 0;
+        return;
+    }
+    let _unlocked = progression.evaluate_cash_milestones(ledger.current_cash);
+    if progression.pending_upgrade_choices > 0 {
+        hold.0 = true;
+        next_state.set(AppState::Paused);
     }
 }
 
@@ -1574,6 +1667,9 @@ impl Plugin for PdDozerPlugin {
             .init_resource::<UpgradeProgression>()
             .init_resource::<MechanicalStress>()
             .init_resource::<TrackInput>()
+            .init_resource::<LiveDriveControl>()
+            .init_resource::<UpgradePickQueue>()
+            .add_event::<UpgradeApplied>()
             .insert_resource(SyncConfig {
                 position_to_transform: false,
                 transform_to_position: false,
@@ -1589,21 +1685,34 @@ impl Plugin for PdDozerPlugin {
                     reset_dozer_on_site_restart_system,
                     ensure_player_dozer_spawned_system.run_if(in_state(AppState::Playing)),
                     read_dozer_keyboard_input_system.run_if(in_state(AppState::Playing)),
-                    evaluate_upgrade_milestones_and_hotkeys_system,
+                    read_upgrade_hotkeys_system,
                 )
                     .chain()
                     .after(PdSystemSet::InputAndClock)
                     .before(PdSystemSet::WorldTilemapSync),
             )
             .add_systems(
+                RunFixedMainLoop,
+                apply_upgrade_picks_system
+                    .in_set(bevy::app::RunFixedMainLoopSystem::BeforeFixedMainLoop),
+            )
+            .add_systems(
                 FixedUpdate,
                 (
-                    ensure_player_dozer_spawned_system,
-                    fixed_dozer_kinematics_system,
-                )
-                    .chain()
-                    .run_if(in_state(AppState::Playing))
-                    .in_set(PdSystemSet::DozerKinematics),
+                    (latch_drive_control_system, apply_upgrade_picks_system)
+                        .chain()
+                        .in_set(PdSystemSet::SimInput),
+                    (
+                        ensure_player_dozer_spawned_system,
+                        fixed_dozer_kinematics_system,
+                    )
+                        .chain()
+                        .run_if(in_state(AppState::Playing))
+                        .in_set(PdSystemSet::DozerKinematics),
+                    evaluate_cash_milestones_system
+                        .in_set(PdSystemSet::SimTickEnd)
+                        .after(pd_core::award_cash_and_advance_sim_tick_system),
+                ),
             );
     }
 }
@@ -2076,18 +2185,28 @@ mod tests {
             app.add_plugins(MinimalPlugins);
             app.init_resource::<ButtonInput<KeyCode>>();
             app.init_resource::<TrackInput>();
+            app.init_resource::<LiveDriveControl>();
+            app.init_resource::<InputAuthority>();
             app.add_event::<AudioTriggerEvent>();
-            app.add_systems(Update, read_dozer_keyboard_input_system);
+            app.add_systems(
+                Update,
+                (read_dozer_keyboard_input_system, latch_drive_control_system).chain(),
+            );
 
             if let Some(mut keys) = app.world_mut().get_resource_mut::<ButtonInput<KeyCode>>() {
                 keys.press(key);
             }
             app.update();
 
+            assert!(
+                app.world().resource::<LiveDriveControl>().blade_pressed,
+                "Expected {:?} to set LiveDriveControl.blade_pressed = true",
+                key
+            );
             let track_input = app.world().resource::<TrackInput>();
             assert!(
                 track_input.blade_pressed,
-                "Expected {:?} to set track_input.blade_pressed = true",
+                "Expected {:?} to latch into track_input.blade_pressed = true",
                 key
             );
             let audio_events = app.world().resource::<Events<AudioTriggerEvent>>();

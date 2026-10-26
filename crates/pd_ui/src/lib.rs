@@ -10,11 +10,13 @@
 use bevy::prelude::*;
 use pd_core::{
     AppState, AudioSfxKind, AudioTriggerEvent, CashLedger, CashPopupPool, DebugTelemetry,
-    ElapsedClock, EnvironmentConfig, GameMode, MAX_CASH_POPUPS, MAX_ODOMETER_CASH, PdSystemSet,
+    ElapsedClock, EnvironmentConfig, GameMode, InputAuthority, MAX_CASH_POPUPS, MAX_ODOMETER_CASH,
+    PdSystemSet,
     SessionEpoch, SiteRestartRequested, sanitize_f32,
 };
 use pd_dozer::{
-    BladeState, MechanicalStress, UpgradeChoice, UpgradeMultipliers, UpgradeProgression,
+    BladeState, MechanicalStress, UpgradeChoice, UpgradeMultipliers, UpgradePickQueue,
+    UpgradeProgression,
 };
 use serde::{Deserialize, Serialize};
 
@@ -664,6 +666,18 @@ pub fn ensure_industrial_hud_spawned_system(
         });
 }
 
+/// Queues a modal upgrade pick for the next tick boundary (`apply_upgrade_picks_system`
+/// applies it and resumes `Playing` once no Campaign choices remain). Ignored during replay.
+fn queue_upgrade_pick(
+    queue: &mut UpgradePickQueue,
+    authority: InputAuthority,
+    choice: UpgradeChoice,
+) {
+    if authority == InputAuthority::Live {
+        queue.push(choice);
+    }
+}
+
 /// Handles mouse clicks on all beveled HUD and Modal buttons (`HudButtonAction`).
 #[allow(clippy::too_many_arguments)]
 pub fn handle_hud_button_interactions_system(
@@ -676,6 +690,7 @@ pub fn handle_hud_button_interactions_system(
     mut telemetry: ResMut<DebugTelemetry>,
     mut restart_writer: EventWriter<SiteRestartRequested>,
     mut audio_writer: EventWriter<AudioTriggerEvent>,
+    (mut pick_queue, authority): (ResMut<UpgradePickQueue>, Res<InputAuthority>),
 ) {
     for (interaction, action) in &interactions {
         if *interaction != Interaction::Pressed {
@@ -777,37 +792,13 @@ pub fn handle_hud_button_interactions_system(
                 );
             }
             HudButtonAction::SelectUpgradeAr400Edge => {
-                if progression.try_apply_choice(
-                    &mut upgrades,
-                    env_config.mode,
-                    UpgradeChoice::Ar400Edge,
-                ) && env_config.mode == GameMode::Campaign
-                    && progression.pending_upgrade_choices == 0
-                {
-                    next_state.set(AppState::Playing);
-                }
+                queue_upgrade_pick(&mut pick_queue, *authority, UpgradeChoice::Ar400Edge);
             }
             HudButtonAction::SelectUpgradeChargeAirKit => {
-                if progression.try_apply_choice(
-                    &mut upgrades,
-                    env_config.mode,
-                    UpgradeChoice::ChargeAirKit,
-                ) && env_config.mode == GameMode::Campaign
-                    && progression.pending_upgrade_choices == 0
-                {
-                    next_state.set(AppState::Playing);
-                }
+                queue_upgrade_pick(&mut pick_queue, *authority, UpgradeChoice::ChargeAirKit);
             }
             HudButtonAction::SelectUpgradeAuxRam => {
-                if progression.try_apply_choice(
-                    &mut upgrades,
-                    env_config.mode,
-                    UpgradeChoice::AuxRam,
-                ) && env_config.mode == GameMode::Campaign
-                    && progression.pending_upgrade_choices == 0
-                {
-                    next_state.set(AppState::Playing);
-                }
+                queue_upgrade_pick(&mut pick_queue, *authority, UpgradeChoice::AuxRam);
             }
         }
     }

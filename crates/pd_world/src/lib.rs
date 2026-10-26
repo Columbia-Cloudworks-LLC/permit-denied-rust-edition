@@ -21,7 +21,7 @@ pub use pd_core::{
 use pd_core::{
     AppState, CampaignLevel, DecalKind, DecalSpawnRequest, EnvironmentConfig, ParticleBurstEvent,
     ParticleBurstKind, PdSystemSet, Season, SessionEpoch, SiteRestartRequested, SiteScoped,
-    WeatherSetting, sanitize_dt, sanitize_f32, sanitize_vec2, sanitize_vec3,
+    SiteSeed, SplitMix64, WeatherSetting, sanitize_dt, sanitize_f32, sanitize_vec2, sanitize_vec3,
 };
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -1968,12 +1968,15 @@ pub struct WorldParticle {
 pub struct WorldParticlePool {
     pub active_particles: VecDeque<Entity>,
     pub weather_spawn_carry: f32,
+    /// Weather spawn serial since the last restart; with `SiteSeed` it seeds spawn positions.
+    pub weather_spawn_serial: u64,
 }
 
 impl WorldParticlePool {
     pub fn clear(&mut self) {
         self.active_particles.clear();
         self.weather_spawn_carry = 0.0;
+        self.weather_spawn_serial = 0;
     }
 }
 
@@ -2577,6 +2580,7 @@ pub fn update_weather_and_burst_particles_system(
     mut commands: Commands,
     time: Res<Time>,
     epoch: Res<SessionEpoch>,
+    site_seed: Option<Res<SiteSeed>>,
     env_config: Res<EnvironmentConfig>,
     mut burst_events: EventReader<ParticleBurstEvent>,
     mut particle_pool: ResMut<WorldParticlePool>,
@@ -2667,10 +2671,14 @@ pub fn update_weather_and_burst_particles_system(
         let to_spawn = (particle_pool.weather_spawn_carry.floor() as u32).min(3);
         particle_pool.weather_spawn_carry -= to_spawn as f32;
 
-        let t = time.elapsed_secs();
-        for i in 0..to_spawn {
-            let hash_x = ((t * 137.0 + (i as f32) * 89.0).sin()) * 260.0;
-            let hash_y = ((t * 97.0 + (i as f32) * 53.0).cos()) * 260.0;
+        let seed = site_seed.map_or(0, |s| s.0);
+        for _ in 0..to_spawn {
+            // Seeded from SiteSeed + spawn serial (not wall-clock time) so captures reproduce.
+            let serial = particle_pool.weather_spawn_serial;
+            particle_pool.weather_spawn_serial = serial.wrapping_add(1);
+            let mut rng = SplitMix64::new(seed ^ SplitMix64::mix(serial));
+            let hash_x = (rng.next_unit_f32() * 2.0 - 1.0) * 260.0;
+            let hash_y = (rng.next_unit_f32() * 2.0 - 1.0) * 260.0;
             let spawn_pos = Vec2::new(sanitize_f32(hash_x, 0.0), sanitize_f32(hash_y, 0.0));
             match env_config.resolved_season {
                 Season::Spring | Season::Summer | Season::Random => {
